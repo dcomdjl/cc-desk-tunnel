@@ -69,6 +69,8 @@ ssh ── TCP ──▶ 服务的回环端口
 5. Windows 侧密钥授权的是当前普通用户；sshd 由一个 Job Object 归属，客户端退出时一并结束。
 6. 一条通道中断只影响它承载的那条 SSH 连接，下一条命令会建立新的通道。通道不再送达数据却没有断开时，两端各自发现：服务端的 `ssh` 每 10 秒询问一次，连续两次没有应答就退出；客户端对每条通道每 15 秒发一次 WebSocket ping，连续两次没有应答就放弃它和本机的那条 SSH 连接。SSH 中断不保证 Windows 上的子进程全部结束；界面只报告实际观察到的结果。
 
+macOS 的执行端、设备归属、权限和更新说明见 [macOS 客户端](macos.md)。平台协议为 15，每个设备连接拥有独立执行通道并允许同时在线；新会话使用 `device` SSH 别名，历史 Windows 别名继续可用。
+
 模块细节见 [Linux 服务](../apps/server/README.md) 与 [Windows 客户端](../apps/desktop/README.md)，端口与证书见[部署与安全边界](deployment.md)。
 
 ## 关键决定

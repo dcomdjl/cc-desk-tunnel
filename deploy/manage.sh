@@ -14,7 +14,7 @@ Usage:
     [--cert FULLCHAIN --key PRIVATE_KEY] [--url wss://DOMAIN/ws] [--token SECRET]
   manage.sh build|up|status|logs|stop|restart|uninstall|connection|summary
   manage.sh upgrade [--from SERVER_ARCHIVE]   rebuild the image and replace the container in place
-  manage.sh client INSTALLER_EXE              offer a Windows installer to connected clients
+  manage.sh client INSTALLER [SHA256SUMS]      verify and offer a Windows EXE or macOS ZIP/DMG
   manage.sh token [SECRET]                    replace the service token (random when omitted) and restart
   manage.sh release-token [FILE]              save a read-only GitHub token for following releases (none: remove)
   manage.sh backup ABSOLUTE_ARCHIVE_PATH
@@ -252,12 +252,24 @@ case "$command" in
     dc build --pull; dc up -d; wait_healthy; summary ;;
   summary) summary ;;
   client)
-    [[ $# = 1 && -f "$1" && "$(basename -- "$1")" =~ ^CC-Desk-Tunnel-Setup-[0-9]+\.[0-9]+\.[0-9]+-x64\.exe$ ]] \
-      || fail "Specify the installer as built: CC-Desk-Tunnel-Setup-X.Y.Z-x64.exe"
+    [[ $# -ge 1 && $# -le 2 && -f "$1" ]] || fail "Specify an installer and its release SHA256SUMS."
+    name="$(basename -- "$1")"
+    [[ "$name" =~ ^CC-Desk-Tunnel-Setup-[0-9]+\.[0-9]+\.[0-9]+-(x64|arm64)\.exe$ \
+       || "$name" =~ ^CC-Desk-Tunnel-[0-9]+\.[0-9]+\.[0-9]+-darwin-(x64|arm64)\.(zip|dmg)$ ]] \
+      || fail "Specify a CC Desk Tunnel Windows EXE or macOS ZIP/DMG as built."
+    checksums="${2:-$(dirname -- "$1")/SHA256SUMS}"
+    [[ -f "$checksums" ]] || fail "Missing release SHA256SUMS; pass it as the second argument."
+    expected="$(awk -v name="$name" '$2 == name {print $1}' "$checksums")"
+    [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || fail "SHA256SUMS must contain exactly one valid entry for $name."
     mkdir -p "$DATA_DIR/state/client"
-    install -m 644 "$1" "$DATA_DIR/state/client/"
-    [[ "$(id -u)" != 0 ]] || chown -R 1000:1000 "$DATA_DIR/state/client"
-    echo "Installer published. Clients see the upgrade the next time they connect."
+    temp="$(mktemp "$DATA_DIR/state/client/.installer.XXXXXX")"
+    trap 'rm -f -- "$temp"' EXIT
+    install -m 644 "$1" "$temp"
+    actual="$(sha256sum -- "$temp")"; actual="${actual%% *}"
+    [[ "$actual" = "$expected" ]] || fail "Installer SHA256 verification failed; nothing installed."
+    [[ "$(id -u)" != 0 ]] || chown 1000:1000 "$temp"
+    mv -- "$temp" "$DATA_DIR/state/client/$name"
+    echo "Verified installer published. Clients see the upgrade the next time they connect."
     ;;
   token)
     # Every saved client login stops working; the summary prints the new token.

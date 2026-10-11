@@ -1,6 +1,9 @@
-# Windows 客户端
+# 桌面客户端
 
-Electron + React 的 Windows 桌面客户端：界面、到服务端的连接桥，以及随连接启停的本机 OpenSSH。登录页和“帮助”菜单里的项目链接由 `src/project.tsx` 配置，地址为空时不显示。
+macOS 本机执行与发行说明见 [macOS 客户端](../../docs/macos.md)。Mac 当前为内测实现：共用界面和 WSS 连接，POSIX SSH 服务在受 IPC 监督的子进程内运行，不启用系统远程登录。正式权限和更新闭环尚待签名安装包验收。
+
+
+Electron + React 的桌面客户端：界面、到服务端的连接桥，以及随连接启停的本机 OpenSSH。登录页和“帮助”菜单里的项目链接由 `src/project.tsx` 配置，地址为空时不显示。
 
 ## 启动
 
@@ -23,7 +26,7 @@ npm.cmd run prepare:windows:package
 npm.cmd run package:windows
 ```
 
-`scripts/package-windows.mjs` 使用 electron-builder 26.15.3 / NSIS；Vite 构建 React 和主进程连接桥 / 协议 / ws，发行包不安装 npm 依赖。`electron/` 下的全部 `.cjs` 模块原样复制，避免新增主进程依赖时遗漏文件。PowerShell 脚本位于 `app.asar.unpacked`；组件位置相对 `resources/vendor`，不依赖开发机器绝对路径。不打包 `.local/` 的秘密 / 历史 / 运维测试文件。版本取自桌面 workspace 的 `package.json`；客户端不自行联网查找新版本：安装包由所连接的服务端提供，下载校验后覆盖升级。
+`scripts/package-windows.mjs` 使用 electron-builder 26.15.3 / NSIS；Vite 构建 React 和主进程连接桥 / 协议 / ws，发行包预置纯 JavaScript SSH 依赖，不在用户机器安装 npm 依赖。`electron/` 下的全部 `.cjs` 模块原样复制，避免新增主进程依赖时遗漏文件。PowerShell 脚本位于 `app.asar.unpacked`；组件位置相对 `resources/vendor`，不依赖开发机器绝对路径。不打包 `.local/` 的秘密 / 历史 / 运维测试文件。版本取自桌面 workspace 的 `package.json`；客户端不自行联网查找新版本：安装包由所连接的服务端提供，下载校验后覆盖升级。
 
 每次打包（包括 `--dir`）完成后，自动对实际 exe 运行 `test/package.spec.ts` 的离线冒烟检查：独立新 profile、移除开发工具 PATH，验证登录页、预加载接口、Git 分支读取和单实例。检查失败使打包命令失败，发布流程不会上传产物；不会使用调用者的真实连接配置。真实连接验证仍需显式启用，不能由离线检查替代。
 
@@ -35,7 +38,7 @@ npm.cmd run package:windows
 
 Electron 选择“远程代理”，输入可信 WSS 地址、代理 token；自签证书填写 SHA256 指纹，可信域名证书将指纹留空使用 CA / 有效期 / 主机名验证。不需要 Ubuntu SSH 账号。主进程完成 TLS 身份验证后才发送 token，收到本次连接的通道密钥后生成临时 SSH key / host key，启动环回 sshd；服务端每要一条执行通道，主进程就另开一条到同一地址的连接并接到本机 sshd 上，Linux 探测成功才进入工作区。
 
-连接跟随 Windows 的系统代理设置（手动、脚本或自动检测，由 Electron 按目标地址解析）：设置里给出 HTTP 代理时，控制连接、执行通道和安装包下载都经它的 CONNECT 隧道到达服务端，证书校验与直连时相同，代理只转发密文；没有代理、目标被设置排除或只给出 SOCKS 代理时直接连接。不支持需要账号密码的代理。
+连接跟随本机系统代理设置（手动、脚本或自动检测，由 Electron 按目标地址解析）：设置里给出 HTTP 代理时，控制连接、执行通道和安装包下载都经它的 CONNECT 隧道到达服务端，证书校验与直连时相同，代理只转发密文；没有代理、目标被设置排除或只给出 SOCKS 代理时直接连接。不支持需要账号密码的代理。
 
 `prepare-ssh.ps1` 显式以 UTF-8 输出连接 JSON，与主进程的解码方式一致，不受 Windows 当前控制台代码页影响；组件宿主把随包 PowerShell 的完整路径放进环境变量 `CC_DESK_TUNNEL_PWSH`，主进程把定时任务文件的位置放进 `CC_DESK_TUNNEL_SCHEDULES`，本机 SSH 服务执行的每条命令都能读到；服务端的提示词只写变量名。命令的 `PATH` 由 sshd 按系统设置重建，不继承，所以不靠它。
 
@@ -63,13 +66,17 @@ Electron 选择“远程代理”，输入可信 WSS 地址、代理 token；自
 | `src/QuestionCard.tsx`、`ComposerControls.tsx`、`PermissionMenu.tsx`、`AccountPanel.tsx`、`UsagePanel.tsx`、`NativeTerminal.tsx` | Claude 提问的作答卡片、模型 / effort / 上下文、审批模式菜单、账号页、调用日志、原生终端 |
 | `src/drafts.ts`、`prefs.ts`、`schedules.ts`、`SchedulePanel.tsx` | 只属于这台电脑的数据：未发送的草稿；置顶、项目显示名称、通知开关与快捷键；定时任务的格式、到点判断与面板 |
 | `src/notifications.ts`、`NoticeBell.tsx`、`exportSession.ts` | 从会话运行状态的变化得出通知，及其列表；把会话导出为 Markdown |
-| `src/ui.tsx`、`paths.ts` | 图标按钮 / 对话框 / 菜单；Windows 路径比较 |
+| `src/ui.tsx`、`paths.ts`、`platform.ts` | 共用交互组件、平台信息、路径语义与文件系统身份 |
 | `electron/main.cjs`、`preload.cjs` | 窗口、托盘、系统通知、IPC（选目录与文件、保存导出、普通会话目录、打开授权页、连接）和暴露给页面的 `window.desktop` |
 | `electron/connect-errors.mjs` | 连接失败时给用户的说明：按系统错误码、TLS 错误和组件的输出区分原因，第一行是原因，其后是该检查的地方 |
 | `electron/git-branch.cjs` | 从仓库文件读出项目当前所在的分支，不依赖本机安装 git |
 | `electron/client-log.cjs` | 连接日志：每次连接的建立、断开与原因，写在用户配置目录的 `logs/` 下，不含凭据和内容 |
 | `electron/proxy-bridge.mjs`、`windows-ssh.mjs`、`tunnel-channels.mjs` | 主进程连接桥：校验服务证书后转发 WSS；启动本机 sshd；按服务端的要求另开到同一地址的连接作为执行通道，接到本机 sshd 上 |
 | `electron/system-proxy.mjs` | 读出系统代理中的 HTTP 代理，并经它建立到服务端的 TCP 连接 |
+| `electron/local-executor.mjs`、`posix-ssh.mjs`、`posix-ssh-worker.mjs` | 平台执行入口与 POSIX SSH 监督进程 |
+| `electron/shell-environment.mjs`、`process-supervisor.mjs`、`project-check.mjs` | 登录环境快照、进程组回收、经 SSH 与 SFTP 检测项目与目标访问 |
+| `electron/project-access.mjs`、`src/projectAccess.ts`、`ProjectAccessDialog.tsx` | 统一访问错误分类、工具失败诊断、条件授权引导与手动恢复 |
+| `electron/project-paths.cjs`、`client-update.cjs`、`mac-updater.cjs` | 本机路径身份与受限空目录清理、更新尝试归属与安装生命周期、已校验 ZIP 的本机更新源 |
 | `electron/prepare-ssh.ps1`、`component-host.ps1` | 生成临时 SSH 配置；用 Job Object 托管 sshd |
 
 `test/` 是 Playwright 界面测试，`test-main/` 是主进程模块与 `client.ts` 的 Node 测试。新增界面状态先看能否放进所属区域的组件，跨区域才上提到 `App.tsx`。
@@ -79,8 +86,8 @@ Electron 选择“远程代理”，输入可信 WSS 地址、代理 token；自
 - 布局：顶部是自绘标题栏（后退 / 前进、侧栏开关、“文件 / 视图 / 帮助”菜单、连接状态），左侧图标栏切换“会话”“定时任务”，底部的齿轮打开账号、设置、帮助与断开连接；有可安装的更新时图标栏多出一个更新按钮。图标栏右边是随页面变化的侧栏（会话列表、任务列表或设置分类），可收起；窄窗口下侧栏浮在页面之上。
 - 设置页分两类：云端 Claude Code 的（账号与额度、常用设置项）和这台电脑上的（关闭时留在托盘、普通会话的文件夹、记住凭据与自动登录、通知），另有帮助与版本更新。
 - 登录页的“本机设置”不需要连接，可改常规、通知和快捷键。“设置 → 常规”里有三项连接等待时间（连接服务器 15 秒、本机 SSH 服务启动 10 秒、执行通道就绪 45 秒，可设 5–600 秒），下次连接时生效；执行通道的等待至少比 SSH 的多 35 秒。
-- 快捷键：后退 / 前进、收起侧栏、新建会话、打开设置、对话内查找和界面缩放各有一个组合键，在设置页的“快捷键”里逐项修改、去掉或整体关闭。按键由页面自己处理，只在本窗口处于前台时起作用，不向系统注册全局热键；内嵌的原生终端里和对话框打开时不响应。安装版不带 Electron 的默认菜单，因此没有设置之外的组合键。
-- 通知：窗口收在托盘或不在前台时，任务完成、失败、等待审批、Claude 提问、定时任务没能发出、连接中断经 Windows 系统通知提醒，点通知回到对应会话；侧栏的铃铛保留最近 50 条。每一类可在设置里单独关闭。只有内容已在本窗口缓存的会话能分辨“提问”与“审批”，其余按“等待审批”提醒。
+- 快捷键：后退 / 前进、收起侧栏、新建会话、打开设置、对话内查找和界面缩放各有一个组合键，在设置页的“快捷键”里逐项修改、去掉或整体关闭。按键由页面自己处理，只在本窗口处于前台时起作用，不向系统注册全局热键；内嵌的原生终端里和对话框打开时不响应。Windows 安装版不带 Electron 默认菜单。Mac 提供原生应用、编辑与窗口菜单，应用动作与页面快捷键共用调度，默认使用 Command，保留自定义组合键。
+- 通知：窗口收在托盘或不在前台时，任务完成、失败、等待审批、Claude 提问、定时任务没能发出、连接中断经系统通知提醒，点通知回到对应会话；左侧图标栏底部、设置上方的铃铛保留最近 50 条，收起侧栏或切换页面仍可查看。每一类可在设置里单独关闭。只有内容已在本窗口缓存的会话能分辨“提问”与“审批”，其余按“等待审批”提醒。
 - 会话与项目可以置顶；项目可以另起一个只在本机显示的名称，可在资源管理器中打开。不提供移除项目与归档。会话菜单可把整个会话导出为 Markdown（先把历史分页取全）。
 - 消息显示本地日期时间，悬浮查看完整时间。文字可框选、右键复制，消息和代码块各有复制按钮；输入框使用系统的右键编辑菜单。
 - Ctrl+F 查找当前对话，Enter / Shift+Enter 跳转，Esc 关闭。查找时临时展开折叠内容，关闭后恢复折叠。只查已经加载的内容：还有更早记录时数量后标注“仅已加载部分”，加载后自动纳入。
@@ -91,7 +98,7 @@ Electron 选择“远程代理”，输入可信 WSS 地址、代理 token；自
 - 输入框里未发送的内容按会话保存在本机用户目录的 `drafts.json`（不经过服务端）：切换会话、关闭窗口、崩溃或强杀后重新打开都还在；发送成功或删除会话后才清除。
 - 会话菜单“分叉会话”把当前会话连同上下文复制成一个新会话；用户消息上的“编辑重发”从该消息之前分叉，并把原文放回输入框。原会话都保留。已执行的文件改动不会撤回。
 - “定时任务”页：到点由客户端向已有会话或新会话发送预设提示词。任务存在用户目录的 `schedules.json`，可在界面编辑，也可以直接改文件或让 Claude 代改；只在客户端运行并已连接时触发，错过超过 10 分钟的那一次跳过。
-- 登录页可“记住凭据 / 自动登录”：服务凭据经 Windows 当前账户加密（DPAPI）后存在用户目录，不落明文。
+- 登录页可“记住凭据 / 自动登录”：服务凭据通过系统账户加密（Windows DPAPI / macOS Keychain）后存在用户目录，不落明文。
 - 会话区默认只显示问题与回复：两段回复之间的工具调用和思考折成一行状态摘要，展开后每个调用一行（动作、对象、增删行数、用时），再点开才是入参与输出；一轮结束后整轮收成“问题—用时—回答”。
 - 设置页的“Claude Code”是云端官方 CLI 用户设置的常用项，下次运行生效；“关于与更新”里有“检查更新”（服务端有新版本时变为“升级服务端到 x.y.z”），以及服务端持有更新的安装包时的“升级客户端到 x.y.z”。服务端版本与客户端不一致而拒绝连接时，登录页给出“升级客户端到 x.y.z”。
 - 服务凭据认证，新建/切换/删除会话，记录 Windows 项目路径；原生 Bash / SSH 按提示词操作真实项目，不建设严格目录沙箱。

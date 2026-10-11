@@ -1,5 +1,8 @@
 # Linux 服务
 
+0.3.0 使用协议 15 的统一设备登记与结构化执行描述，支持 Windows PowerShell 与 macOS POSIX 执行端；会话保存执行设备归属，历史跨设备执行需显式重新绑定。更新资产按平台与架构选择并分别保留，见 [macOS 客户端](../../docs/macos.md)。
+
+
 Linux 上的代理服务：认证客户端、管理会话、驱动官方 Claude Code、维护到 Windows 的执行通道，并记录调用统计。`src/throttle.ts` 按来源地址限制凭据错误的重试和未认证连接的数量。
 
 ## 开发入口

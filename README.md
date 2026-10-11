@@ -2,9 +2,9 @@
 
 **简体中文** | [English](README.en.md)
 
-用桌面客户端驱动云端的 Claude Code，经反向隧道在你的 Windows 本机执行。
+用桌面客户端驱动云端的 Claude Code，经反向隧道在你的本机项目中执行。
 
-Claude Code（简称 CC）运行在一台 Linux 服务器上；项目代码、编译器和各种工具都留在 Windows 本机。CC Desk Tunnel 把两端接起来：服务器上是一个容器，Windows 上是一个桌面客户端，Claude 通过一条加密的反向 SSH 通道在你的电脑上读写文件、执行命令。
+Claude Code（简称 CC）运行在一台 Linux 服务器上；项目代码、编译器和各种工具都留在本机。CC Desk Tunnel 把两端接起来：服务器上是一个容器，本机上是一个桌面客户端，Claude 通过一条加密的反向 SSH 通道在你的电脑上读写文件、执行命令。
 
 [下载](https://github.com/sun168567/cc-desk-tunnel/releases/latest) · [快速开始](#快速开始) · [安全须知](#安全须知) · [文档](#文档) · 许可：[Apache-2.0](LICENSE)
 
@@ -44,6 +44,10 @@ Claude Code（简称 CC）运行在一台 Linux 服务器上；项目代码、�
 | **省心** | 托盘后台、记住凭据与自动登录、未发送内容按会话保存 |
 | **一键升级** | 服务端跟踪发布页；在客户端里点一下即可升级服务端和客户端，不必登录服务器 |
 
+## 平台支持
+
+Windows 客户端沿用现有安装与执行链路。macOS 已加入本机 SSH、项目检测、系统交互和打包更新实现，目前为内测状态，最低 macOS 13；正式签名、公证、真实账号、Intel 与 Windows 安装回归尚待验收。开发和验证方法见 [macOS 客户端说明](docs/macos.md)。
+
 ## 快速开始
 
 需要：一台有公网 IP 或域名的 Linux 服务器（x86_64，推荐 Ubuntu，已安装 Docker），和一台 Windows 10 / 11 x64 电脑。
@@ -72,6 +76,8 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-t
 从[发布页](https://github.com/sun168567/cc-desk-tunnel/releases/latest)下载 `CC-Desk-Tunnel-Setup-<版本>-x64.exe` 并安装。安装包自带 PowerShell 7 和 OpenSSH，不需要另装任何东西。启动后填入上一步的三项信息并连接。
 
 首次运行会遇到 SmartScreen 提示，处理方法见[杀毒软件与 SmartScreen](#杀毒软件与-smartscreen)。
+
+macOS 内测从源码构建：`npm ci`、`npm run setup:desktop`、`npm run package:macos -- --unsigned --dir`。内测构建不支持应用内自动更新，正式版本需完成签名、公证与实机验收后才能分发。
 
 ### 3. 登录 Claude
 
@@ -161,7 +167,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-t
 | [安全说明](SECURITY.md) | 威胁模型、已有防护、已知不足、漏洞报告 |
 | [架构](docs/architecture.md) | 组成、连接建立过程、关键设计决定 |
 | [原生运行与会话存储](docs/native-runtime.md) | 如何驱动官方 CLI、上下文归属、审批、保留期 |
-| [Windows 客户端](apps/desktop/README.md) · [Linux 服务](apps/server/README.md) · [消息契约](packages/protocol/README.md) | 各模块的实现说明 |
+| [桌面客户端](apps/desktop/README.md) · [macOS 使用与发行](docs/macos.md) · [Linux 服务](apps/server/README.md) · [消息契约](packages/protocol/README.md) | 各模块的实现说明 |
 | [路线与现状](docs/roadmap.md) · [变更记录](CHANGELOG.md) | 已完成、待验证、计划；各版本的变化 |
 | [开发约定](docs/development.md) | 分支、提交、检查、发布 |
 
@@ -176,11 +182,12 @@ npm ci
 npm run dev               # 本地模拟服务 + 浏览器界面，不需要任何账号
 npm test                  # 单元测试；另有 typecheck、test:ui、check
 npm run package:windows   # 生成 Windows 安装包，准备步骤见 apps/desktop/README.md
+npm run package:macos -- --unsigned --dir # Mac 本机内测包
 npm run package:server    # 生成服务端程序包，传到服务器后运行其中的 deploy/install.sh
 ```
 
 ```text
-apps/desktop/       Windows 客户端：界面（React）、Electron 主进程、连接桥与本机执行组件
+apps/desktop/       桌面客户端：界面（React）、Electron 主进程、连接桥与本机执行组件
 apps/server/        Linux 服务：会话管理、Claude Code 适配、Windows 隧道、调用统计、版本跟踪
 packages/protocol/  两端消息契约（Zod）
 deploy/             Docker 部署与运维脚本

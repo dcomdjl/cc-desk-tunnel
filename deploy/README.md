@@ -150,3 +150,10 @@ sudo bash deploy/manage.sh up
 自签续期：`manage.sh renew`，重启后重新交付客户端指纹。真实证书续期：`manage.sh certificate FULLCHAIN KEY`；可在既有 ACME deploy hook 中调用。nginx 的证书由既有 ACME / nginx 续期流程处理，无需重建容器。替换会断开在途会话，先结束任务。
 
 原生开发部署仍有 `scripts/install-linux.sh` 与 `scripts/deploy-linux.mjs`，目前为普通用户 nohup 调试方式，不是生产部署方案。
+
+
+## 多平台客户端安装包
+
+0.3.0 起，服务端从发布清单同步 Windows x64 与 macOS arm64/x64 资产，认证响应和下载按当前设备的平台与架构选择，不会向 Mac 提供 Windows EXE。各平台分别保留最近三个版本。
+
+手动加入已下载的正式客户端资产可执行 `manage.sh client ASSET [SHA256SUMS]`，接受项目约定命名的 EXE、Mac ZIP 或 DMG。省略第二参数时使用资产旁的 `SHA256SUMS`；脚本必须匹配唯一清单条目并校验 SHA256 后才原子替换。Mac ZIP 用于签名自动更新，DMG 用于手动安装。

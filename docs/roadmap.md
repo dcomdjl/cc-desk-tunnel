@@ -1,5 +1,12 @@
 # 路线与现状
 
+## macOS 实施与验收
+
+0.3.0 已加入平台协议、设备归属与历史迁移、POSIX SSH/进程监督/登录环境、路径身份与项目访问检测、Mac 菜单和 Command 快捷键，以及多架构打包、签名公证配置和更新交付。已在本机 Apple Silicon 上验证 OpenSSH、SFTP/scp、WSS 传输、Electron 系统交互与未签名打包启动。
+
+仍待正式发行验收：Developer ID 与公证产物、Finder 启动后的 TCC 权限拒绝/恢复/撤销、Keychain 更新连续性、实际签名更新安装、真实 Linux 服务与 Claude 账号、Intel 硬件、最低系统版本、大小写敏感卷与外部卷、Windows 安装包回归。未签名内测结果不替代这些验收。详见 [macOS 客户端](macos.md)。
+
+
 ## 已完成
 
 - 两端消息契约、离线模拟服务与界面，用于不依赖账号的开发和回归。

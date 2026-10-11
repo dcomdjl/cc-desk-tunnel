@@ -56,6 +56,12 @@ This repository publishes all of its own client, server, build and deployment so
 | **Convenience** | Runs in the tray, remembers the sign-in, keeps unsent text per session |
 | **One-click upgrades** | The service follows the release page; upgrade service and client from the client, without logging in to the server |
 
+## Platform status
+
+The Windows client keeps its existing execution and installer flow. macOS now has a local SSH executor, project access checks, native menus and Command shortcuts, plus arm64/x64 packaging and update delivery. It is an internal test implementation requiring macOS 13 or newer. Signed installation, real account workflows, privacy permissions, Intel hardware and Windows package regression still require validation. See the [macOS client guide](docs/macos.md).
+
+To build a local unsigned Mac test app, run `npm ci`, `npm run setup:desktop`, then `npm run package:macos -- --unsigned --dir`. Unsigned test builds do not support automatic updates.
+
 ## Quick start
 
 You need a Linux server with a public IP or domain name (x86_64, Ubuntu recommended, Docker installed) and a Windows 10 / 11 x64 PC.

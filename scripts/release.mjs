@@ -1,12 +1,19 @@
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  assertStableClientAssets,
+  collectClientAssets,
+  fileDigest,
+  sourceRevision,
+  stageClientAssets,
+} from './release-assets.mjs';
 
 // Builds the release files for the version in apps/desktop/package.json and uploads them to a GitHub release.
 // The release stays a draft unless --publish is given; --prerelease selects the preview channel.
-// --dry-run only builds. Needs gh (or GH pointing at it) and GH_TOKEN.
+// --dry-run only builds. Repeated --client-assets=DIR assembles packages produced on other build machines.
+// Without --client-assets, the native Windows/macOS package is built. Needs gh (or GH pointing at it) and GH_TOKEN.
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dryRun = process.argv.includes('--dry-run');
 const publish = process.argv.includes('--publish');
@@ -33,29 +40,6 @@ const section = new RegExp(
   .trim();
 if (!section) throw new Error(`CHANGELOG.md has no section "## ${version}".`);
 const repository = 'https://github.com/sun168567/cc-desk-tunnel';
-// Every release reads the same way: what the project is, this version's section of the change log with its
-// headings one level up, then how to get and upgrade to it.
-const notes = [
-  '> 用桌面客户端驱动云端的 Claude Code，经反向隧道在你的 Windows 本机执行。',
-  '',
-  section.replace(/^### /gm, '## '),
-  '',
-  '---',
-  '',
-  '## 下载与升级',
-  '',
-  prerelease
-    ? '- **预发布版本**：不会通过稳定版的自动更新提供。请手动下载本页的服务端程序包与 Windows 安装包，两端一起升级；部署脚本的 latest 下载入口仍指向稳定版。'
-    : `- **已在使用**：在客户端的“设置 → 关于与更新”里先升级服务端，再按提示升级客户端；两端需要同一版本。`,
-  `- **Windows 客户端**：下载 \`CC-Desk-Tunnel-Setup-${version}-x64.exe\` 并安装。安装包没有代码签名，SmartScreen 与杀毒软件的提示见[说明](${repository}#杀毒软件与-smartscreen)。`,
-  prerelease
-    ? `- **服务端**：下载本页的 \`cc-desk-tunnel-server-${version}.tar.gz\`，按[部署手册](${repository}/blob/main/deploy/README.md)的手动准备步骤校验、解压并运行安装脚本。`
-    : `- **服务端**：新部署按[快速开始](${repository}#快速开始)用一条命令安装；\`cc-desk-tunnel-server-${version}.tar.gz\` 是它下载的程序包。`,
-  '- **校验**：各文件的 SHA256 在 `SHA256SUMS` 与 `release.json` 中。',
-  '',
-  `文档：[部署手册](${repository}/blob/main/deploy/README.md) · [变更记录](${repository}/blob/main/CHANGELOG.md) · [安全须知](${repository}#安全须知)`,
-].join('\n');
-
 // A release is cut from exactly what the main branch on GitHub holds, so the tag matches the files.
 const commit = git('rev-parse', 'HEAD');
 if (!dryRun) {
@@ -72,35 +56,82 @@ if (!dryRun) {
 }
 
 const output = join(root, 'artifacts/release');
+const server = `cc-desk-tunnel-server-${version}.tar.gz`;
+const contributed = process.argv
+  .filter((arg) => arg.startsWith('--client-assets='))
+  .map((arg) => resolve(arg.slice('--client-assets='.length)));
+const comparable = (path) => (process.platform === 'win32' ? path.toLowerCase() : path);
+if (
+  contributed.some(
+    (directory) =>
+      comparable(directory) === comparable(output) ||
+      comparable(directory).startsWith(comparable(`${output}${sep}`)),
+  )
+)
+  throw new Error(
+    '--client-assets must be outside artifacts/release, which is replaced during assembly.',
+  );
+if (!contributed.length) {
+  if (!['win32', 'darwin'].includes(process.platform))
+    throw new Error(
+      'Linux release assembly requires --client-assets=DIR from Windows/macOS build machines.',
+    );
+  run(
+    process.execPath,
+    [process.platform === 'darwin' ? 'scripts/package-macos.mjs' : 'scripts/package-windows.mjs'],
+    { stdio: 'inherit' },
+  );
+}
+const directories = contributed.length
+  ? contributed
+  : ['windows', 'macos'].map((platform) => join(root, 'artifacts', platform)).filter(existsSync);
+const clients = await collectClientAssets(directories, version, commit);
+if (!prerelease) assertStableClientAssets(clients);
+// Every release reads the same way: what the project is, this version's section of the change log with its
+// headings one level up, then how to get and upgrade to it.
+const notes = [
+  '> 用桌面客户端驱动云端的 Claude Code，经反向隧道在你的本机执行。',
+  '',
+  section.replace(/^### /gm, '## '),
+  '',
+  '---',
+  '',
+  '## 下载与升级',
+  '',
+  prerelease
+    ? '- **预发布版本**：不会通过稳定版的自动更新提供。请手动下载本页的服务端程序包与对应平台安装包，两端一起升级；部署脚本的 latest 下载入口仍指向稳定版。'
+    : `- **已在使用**：在客户端的“设置 → 关于与更新”里先升级服务端，再按提示升级客户端；两端需要同一版本。`,
+  ...(clients.some((client) => client.platform === 'win32')
+    ? [
+        `- **Windows 客户端**：下载 \`CC-Desk-Tunnel-Setup-${version}-x64.exe\` 并安装。安装包没有代码签名，SmartScreen 与杀毒软件的提示见[说明](${repository}#杀毒软件与-smartscreen)。`,
+      ]
+    : []),
+  ...clients
+    .filter((client) => client.format === 'dmg')
+    .map(
+      (client) =>
+        `- **macOS ${client.arch} 客户端**：下载 \`${client.name}\` 安装；ZIP 用于应用内更新。`,
+    ),
+  prerelease
+    ? `- **服务端**：下载本页的 \`cc-desk-tunnel-server-${version}.tar.gz\`，按[部署手册](${repository}/blob/main/deploy/README.md)的手动准备步骤校验、解压并运行安装脚本。`
+    : `- **服务端**：新部署按[快速开始](${repository}#快速开始)用一条命令安装；\`cc-desk-tunnel-server-${version}.tar.gz\` 是它下载的程序包。`,
+  '- **校验**：各文件的 SHA256 在 `SHA256SUMS` 与 `release.json` 中。',
+  '',
+  `文档：[部署手册](${repository}/blob/main/deploy/README.md) · [变更记录](${repository}/blob/main/CHANGELOG.md) · [安全须知](${repository}#安全须知)`,
+].join('\n');
+
 rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
-const installer = `CC-Desk-Tunnel-Setup-${version}-x64.exe`;
-const server = `cc-desk-tunnel-server-${version}.tar.gz`;
-// Packaging now and then fails on a file another program holds open for a moment; waiting is enough.
-for (let attempt = 1; ; attempt++) {
-  try {
-    run(process.execPath, ['scripts/package-windows.mjs'], { stdio: 'inherit' });
-    break;
-  } catch (error) {
-    if (attempt === 3) throw error;
-    console.log('Packaging failed; trying again in a minute.');
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
-  }
-}
-copyFileSync(join(root, 'artifacts/windows', installer), join(output, installer));
+await stageClientAssets(clients, output);
 run(process.execPath, ['scripts/package-server.mjs', join(output, server)], { stdio: 'inherit' });
-
-const files = [installer, server].map((name) => ({
-  name,
-  size: statSync(join(output, name)).size,
-  sha256: createHash('sha256')
-    .update(readFileSync(join(output, name)))
-    .digest('hex'),
-}));
+const files = [
+  ...clients.map(({ path, version, ...file }) => file),
+  { name: server, ...(await fileDigest(join(output, server))) },
+];
 // release.json is what programs read; SHA256SUMS is the same hashes for `sha256sum -c`.
 writeFileSync(
   join(output, 'release.json'),
-  JSON.stringify({ version, protocol, runtime, commit, files }, null, 2) + '\n',
+  JSON.stringify({ schemaVersion: 2, version, protocol, runtime, commit, files }, null, 2) + '\n',
 );
 writeFileSync(
   join(output, 'SHA256SUMS'),
@@ -112,6 +143,9 @@ for (const file of files) console.log(`${file.sha256}  ${file.name}  (${file.siz
 if (dryRun) {
   console.log(`Built ${tag} in ${output}; nothing uploaded.`);
 } else {
+  const source = sourceRevision(root);
+  if (!source.sourceClean || source.sourceCommit !== commit)
+    throw new Error('发布组装期间源码发生变化，请从目标提交重新构建。');
   const url = run(gh, [
     'release',
     'create',
@@ -124,7 +158,9 @@ if (dryRun) {
     `CC Desk Tunnel ${version}`,
     '--notes-file',
     join(output, 'notes.md'),
-    ...[installer, server, 'release.json', 'SHA256SUMS'].map((name) => join(output, name)),
+    ...[...files.map((file) => file.name), 'release.json', 'SHA256SUMS'].map((name) =>
+      join(output, name),
+    ),
   ]).trim();
   console.log(`${publish ? 'Published' : 'Draft'} release: ${url}`);
 }
