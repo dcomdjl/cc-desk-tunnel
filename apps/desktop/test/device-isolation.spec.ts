@@ -302,6 +302,11 @@ test('sharing a device ID across platforms cannot expose another platform as loc
     .locator('.session-select')
     .click();
   await expect(page.getByRole('textbox', { name: '消息', exact: true })).toHaveCount(0);
+  const row = page.locator('.session-row').filter({ hasText: foreign.title });
+  await row.hover();
+  await row.getByRole('button', { name: '会话操作', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: '移到其他项目…', exact: true })).toHaveCount(0);
+  await page.keyboard.press('Escape');
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
   expect(
     await page.evaluate(() => (window as unknown as TestWindow).isolationCalls.branches),

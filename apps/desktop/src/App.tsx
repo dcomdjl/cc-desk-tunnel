@@ -823,7 +823,7 @@ export function App() {
         },
       },
       // A session on another computer is taken over first, with a directory here.
-      ...(isHere(session, state.device)
+      ...(onThisDevice(session)
         ? [
             {
               label: '移到其他项目…',
