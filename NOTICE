@@ -11,7 +11,7 @@ software, which stays under its own terms:
 - Claude Code and the Claude Agent SDK (Anthropic). Installed from the official
   npm packages at build or deployment time and used under Anthropic's terms.
 
-The Windows installer and the server image redistribute these unmodified
+The desktop installers and the server image redistribute these unmodified
 third-party components, each under its own license:
 
 - Win32-OpenSSH (https://github.com/PowerShell/Win32-OpenSSH), BSD-style
@@ -23,3 +23,6 @@ third-party components, each under its own license:
   dependencies under their respective licenses.
 
 npm dependencies are listed in package-lock.json and keep their own licenses.
+
+The macOS client also includes ssh2 (https://github.com/mscdex/ssh2), MIT License,
+and uses the operating system OpenSSH client and SFTP server without redistributing them.
