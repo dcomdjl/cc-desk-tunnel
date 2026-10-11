@@ -1,9 +1,57 @@
 import { z } from 'zod';
 
-export const PROTOCOL_VERSION = 14;
+export const PROTOCOL_VERSION = 15;
 export const MAX_FRAME_BYTES = 256 * 1024;
 const id = z.uuid();
 const timestamp = z.iso.datetime();
+// Filesystem paths are values: a trailing space may be part of a POSIX directory name.
+const projectPath = z
+  .string()
+  .min(1)
+  .max(2048)
+  .refine((value) => value.trim().length > 0);
+export const devicePlatformSchema = z.enum(['win32', 'darwin', 'linux']);
+const devicePath = z
+  .string()
+  .min(1)
+  .max(2048)
+  .regex(/^[^\0\r\n]+$/);
+const windowsDevicePath = devicePath.regex(/^(?:[A-Za-z]:[\\/]|\\\\)[^"\r\n]+$/);
+const posixDevicePath = devicePath.regex(/^\//);
+const deviceFields = {
+  deviceId: id,
+  name: z.string().trim().min(1).max(120).optional(),
+  arch: z.enum(['x64', 'arm64']),
+  schedulesPath: devicePath,
+  capabilities: z.object({ exec: z.literal(true), sftp: z.literal(true) }).strict(),
+};
+export const deviceDescriptorSchema = z.discriminatedUnion('platform', [
+  z
+    .object({
+      ...deviceFields,
+      platform: z.literal('win32'),
+      schedulesPath: windowsDevicePath,
+      shell: z.object({ kind: z.literal('powershell'), path: windowsDevicePath }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...deviceFields,
+      platform: z.literal('darwin'),
+      schedulesPath: posixDevicePath,
+      shell: z.object({ kind: z.literal('posix'), path: posixDevicePath }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...deviceFields,
+      platform: z.literal('linux'),
+      schedulesPath: posixDevicePath,
+      shell: z.object({ kind: z.literal('posix'), path: posixDevicePath }).strict(),
+    })
+    .strict(),
+]);
+export type DeviceDescriptor = z.infer<typeof deviceDescriptorSchema>;
 export const permissionModeSchema = z.enum(['auto', 'default', 'plan', 'acceptEdits']);
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
 export const effortSchema = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -290,30 +338,39 @@ export type SessionEvent = z.infer<typeof eventSchema>;
 // One of the user's computers: the client there makes the ID once and keeps it.
 export const deviceSchema = z.object({ id, name: z.string().trim().min(1).max(120) });
 export type Device = z.infer<typeof deviceSchema>;
-export const sessionSchema = z.object({
+const currentSessionSchema = z.object({
   id,
   title: z.string().min(1).max(120),
   autoTitle: z.boolean().default(false),
   projectPath: z.string().min(1).max(2048),
-  // The computer the project directory is on, and so the only one to send the session messages. A session
-  // from before 0.2.11 has none until a computer sends it one.
   device: deviceSchema.optional(),
+  // Records created before device binding belonged to a Windows project.
+  platform: devicePlatformSchema.default('win32'),
   permissionMode: permissionModeSchema.default('auto'),
   model: z.string().trim().min(1).max(200).nullable().default(null),
   effort: effortSchema.nullable().default(null),
   // A fork keeps its native history beside the session it was forked from; this names that session.
   nativeRoot: id.optional(),
-  // What the system prompt of the session's native runs says. It is kept word for word until a compaction,
-  // which loses the prompt cache anyway: a move to another project or another computer is told to Claude
-  // with the user's next message instead, and `told` is what it was last told that way.
+  // Accepted system-prompt values remain stable until compaction. Moves and environment changes are
+  // announced with user inputs; `toldDevice` advances only after the SDK confirms receipt. The PowerShell
+  // fields preserve the template of historical Windows sessions until their next compaction.
   prompt: z
     .object({
       projectPath: z.string(),
-      device: id.optional(),
-      told: z.object({ projectPath: z.string(), device: id.optional() }).optional(),
+      powershellPath: z.string().optional(),
+      toldPowershellPath: z.string().optional(),
+      device: deviceDescriptorSchema.optional(),
+      toldDevice: deviceDescriptorSchema.optional(),
+      // The 0.2.11 environment-variable prompt remains byte-stable until compaction.
+      format: z.literal('environment').optional(),
+      legacyDeviceId: id.optional(),
       compacted: z.boolean().optional(),
     })
     .optional(),
+  // The project path Claude was last told, while the move away from it has not been mentioned to it yet.
+  movedFrom: z.string().optional(),
+  movedFromPlatform: devicePlatformSchema.optional(),
+  movedFromDevice: id.optional(),
   createdAt: timestamp,
   updatedAt: timestamp,
   activeRun: z
@@ -326,6 +383,47 @@ export const sessionSchema = z.object({
     })
     .nullable(),
 });
+// All persisted shapes normalize at one boundary. Legacy IDs are read once and
+// never written as a second independently mutable owner field.
+export const sessionSchema = z.preprocess((value, context) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = { ...(value as Record<string, unknown>) };
+  if (record.deviceId !== undefined && !id.safeParse(record.deviceId).success) {
+    context.addIssue({ code: 'custom', message: 'Invalid legacy device identity' });
+    return z.NEVER;
+  }
+  if (
+    typeof record.deviceId === 'string' &&
+    record.device &&
+    (record.device as { id?: unknown }).id !== record.deviceId
+  ) {
+    context.addIssue({ code: 'custom', message: 'Conflicting device identities' });
+    return z.NEVER;
+  }
+  if (typeof record.deviceId === 'string' && !record.device) {
+    record.device = {
+      id: record.deviceId,
+      name:
+        record.platform === 'darwin' ? 'macOS' : record.platform === 'linux' ? 'Linux' : 'Windows',
+    };
+  }
+  if (record.prompt && typeof record.prompt === 'object') {
+    const prompt = { ...(record.prompt as Record<string, unknown>) };
+    if (typeof prompt.device === 'string') {
+      prompt.format = 'environment';
+      prompt.legacyDeviceId = prompt.device;
+      delete prompt.device;
+      const told = prompt.told as { projectPath?: string; device?: string } | undefined;
+      if (told?.projectPath && told.projectPath !== record.projectPath) {
+        record.movedFrom ??= told.projectPath;
+        record.movedFromPlatform ??= 'win32';
+      }
+    }
+    record.prompt = prompt;
+  }
+  delete record.deviceId;
+  return record;
+}, currentSessionSchema);
 export type Session = z.infer<typeof sessionSchema>;
 export const snapshotSchema = z.object({ session: sessionSchema, events: z.array(eventSchema) });
 export type SessionSnapshot = z.infer<typeof snapshotSchema>;
@@ -343,6 +441,9 @@ const installerSchema = z.object({
   version: versionSchema,
   size: z.number().int().positive(),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  platform: devicePlatformSchema.optional(),
+  arch: z.enum(['x64', 'arm64']).optional(),
+  format: z.enum(['exe', 'zip', 'dmg', 'AppImage']).optional(),
 });
 // Where the service stands against the published releases. `manual` is a newer release this installation cannot
 // install by itself; `installing` carries the step in `detail`, `failed` the reason.
@@ -360,7 +461,7 @@ export const commandSchema = z.discriminatedUnion('type', [
       type: z.literal('session.create'),
       ...request,
       title: z.string().trim().min(1).max(120),
-      projectPath: z.string().trim().min(1).max(2048),
+      projectPath,
     })
     .strict(),
   z.object({ type: z.literal('account.status'), ...request }).strict(),
@@ -425,13 +526,13 @@ export const commandSchema = z.discriminatedUnion('type', [
       effort: effortSchema.nullable().optional(),
     })
     .strict(),
-  // Points a session at a project directory on the computer that asks, which the session is on from then.
+  // Explicitly binds the session to the connected device and project directory.
   z
     .object({
       type: z.literal('session.move'),
       ...request,
       sessionId: id,
-      projectPath: z.string().trim().min(1).max(2048),
+      projectPath,
     })
     .strict(),
   z.object({ type: z.literal('session.compact'), ...request, sessionId: id }).strict(),
@@ -546,11 +647,20 @@ export const authSchema = z
     token: z.string().min(24).max(512),
     deviceName: z.string().trim().min(1).max(120),
     tunnel: z.boolean().default(false),
+    // Optional so an older first frame can still receive a readable version mismatch response.
+    device: deviceDescriptorSchema.optional(),
   })
   .strict();
 // Which of the user's computers the connection is from, named by `auth.deviceName`. It follows `auth` as a
 // frame of its own because the frame of `auth` has to stay what every version reads.
-export const deviceIdentitySchema = z.object({ type: z.literal('device'), id }).strict();
+export const deviceIdentitySchema = z
+  .object({
+    type: z.literal('device'),
+    id,
+    platform: devicePlatformSchema.optional(),
+    arch: z.enum(['x64', 'arm64']).optional(),
+  })
+  .strict();
 export const serverMessageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('ready'),
@@ -561,7 +671,7 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     // The service's own release version, and where it stands against the published releases if it follows them.
     version: versionSchema,
     update: serviceUpdateSchema.optional(),
-    // The newest Windows installer the service holds, for clients that want to upgrade themselves.
+    // The newest installer for the authenticated client's platform and architecture.
     client: installerSchema.optional(),
     sessions: z.array(sessionSchema),
   }),
@@ -612,6 +722,7 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       .optional(),
     client: installerSchema.optional(),
   }),
+  z.object({ type: z.literal('client.release'), client: installerSchema.nullable() }),
   z.object({ type: z.literal('service.update'), ...serviceUpdateSchema.shape }),
   // The execution channel runs over connections the device opens to this same address. `secret` signs them
   // in; it belongs to this connection alone and ends with it.
@@ -647,6 +758,7 @@ export const tunnelCredentialsSchema = z
       .regex(/^[a-zA-Z0-9_.\\@-]+$/),
     privateKey: z.string().min(1).max(16384),
     hostPublicKey: z.string().regex(/^ssh-ed25519 [A-Za-z0-9+/=]+$/),
+    device: deviceDescriptorSchema,
   })
   .strict();
 export type TunnelCredentials = z.infer<typeof tunnelCredentialsSchema>;

@@ -48,8 +48,8 @@ export default function ShortcutSettings() {
         </div>
         <h2 className="page-heading">组合键</h2>
         <p className="muted">
-          点一项后按下新的组合键（需要包含 Ctrl 或 Alt，或是功能键）；按 Esc 取消，按 Backspace
-          去掉这一项的快捷键。
+          点一项后按下新的组合键（需要包含 Ctrl、Command 或 Alt，或是功能键）；按 Esc 取消，按
+          Backspace 去掉这一项的快捷键。
         </p>
         {failure && (
           <p className="error-text" role="alert">
@@ -86,7 +86,9 @@ export default function ShortcutSettings() {
                     const pressed = comboOf(event);
                     if (!pressed) return;
                     if (!usable(pressed))
-                      return setFailure(`${show(pressed)} 会妨碍正常输入；请加上 Ctrl 或 Alt。`);
+                      return setFailure(
+                        `${show(pressed)} 会妨碍正常输入；请加上 Ctrl、Command 或 Alt。`,
+                      );
                     const taken = listed.find(
                       (other) => other.id !== id && keyFor(prefs, other.id) === pressed,
                     );

@@ -1,6 +1,18 @@
 const { contextBridge, ipcRenderer, webFrame, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('desktop', {
   dev: process.argv.includes('--cc-desk-tunnel-dev'),
+  platform:
+    process.argv.find((value) => value.startsWith('--cc-desk-tunnel-platform='))?.split('=')[1] ??
+    process.platform,
+  deviceInfo: () => ipcRenderer.invoke('device:info'),
+  projectIdentities: (directories) => ipcRenderer.invoke('project:identities', directories),
+  checkProject: (directory, options) => ipcRenderer.invoke('project:check', directory, options),
+  openPrivacySettings: () => ipcRenderer.invoke('privacy:open'),
+  onMenuAction: (callback) => {
+    const listener = (_event, action) => callback(action);
+    ipcRenderer.on('menu:action', listener);
+    return () => ipcRenderer.removeListener('menu:action', listener);
+  },
   chooseProject: () => ipcRenderer.invoke('project:choose'),
   chooseFiles: () => ipcRenderer.invoke('files:choose'),
   pathForFile: (file) => webUtils.getPathForFile(file),

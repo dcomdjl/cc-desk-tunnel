@@ -82,6 +82,22 @@ test('a requested channel signs in with the tunnel secret and joins the local SS
   await f.until(() => channels.size === 0, 'channels to be forgotten');
   assert.deepEqual(failures, []);
 });
+
+test('a local TCP EOF drains all queued bytes before the WebSocket closes', async (t) => {
+  const f = await fixture(t);
+  const channels = openChannels(offer, f.port, f.dial, () => assert.fail('channel failure'));
+  t.after(() => channels.close());
+  channels.open(randomUUID());
+  await f.until(() => f.arrivals[0]?.frames.length >= 2, 'greeting');
+  const content = Buffer.alloc(4 * 1024 * 1024, 0x5a);
+  const closed = once(f.arrivals[0].socket, 'close');
+  f.locals[0].end(content);
+  assert.ok([1000, 1005].includes((await closed)[0]), 'the peer receives a normal close handshake');
+  const payload = Buffer.concat(
+    f.arrivals[0].frames.filter((frame) => frame.binary).map((frame) => frame.data),
+  );
+  assert.deepEqual(payload, Buffer.concat([Buffer.from('SSH-2.0-local\r\n'), content]));
+});
 test('a channel that cannot connect is tried again, and given up without ending the connection', async (t) => {
   const f = await fixture(t);
   const failures = [];

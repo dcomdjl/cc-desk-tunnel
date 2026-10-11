@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  existsSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -19,19 +19,25 @@ import type { ServiceUpdate } from '@cc-desk-tunnel/protocol';
 import { ServiceUpdates, isNewer, serviceVersion } from '../src/updates.ts';
 
 // A stand-in for the GitHub releases API: one latest release with a manifest and an installer.
-async function feed(t: TestContext, version: string, runtime = 1) {
+async function feed(t: TestContext, version: string, runtime = 1, mac = false) {
   const installer = Buffer.from(`installer ${version}`);
   const name = `CC-Desk-Tunnel-Setup-${version}-x64.exe`;
+  const assets = new Map([[name, installer]]);
+  if (mac)
+    for (const arch of ['x64', 'arm64'])
+      for (const format of ['zip', 'dmg'])
+        assets.set(
+          `CC-Desk-Tunnel-${version}-darwin-${arch}.${format}`,
+          Buffer.from(`mac ${arch} ${format}`),
+        );
   const manifest = {
     version,
     runtime,
-    files: [
-      {
-        name,
-        size: installer.length,
-        sha256: createHash('sha256').update(installer).digest('hex'),
-      },
-    ],
+    files: [...assets].map(([name, content]) => ({
+      name,
+      size: content.length,
+      sha256: createHash('sha256').update(content).digest('hex'),
+    })),
   };
   const requests: { url: string; authorization?: string }[] = [];
   const server = createServer((request, response) => {
@@ -42,13 +48,19 @@ async function feed(t: TestContext, version: string, runtime = 1) {
         JSON.stringify({
           assets: [
             { name: 'release.json', url: `${base}/assets/1` },
-            { name, url: `${base}/assets/2` },
+            ...[...assets.keys()].map((name, index) => ({
+              name,
+              url: `${base}/assets/${index + 2}`,
+            })),
           ],
         }),
       );
     else if (request.url === '/assets/1') response.end(JSON.stringify(manifest));
-    else if (request.url === '/assets/2') response.end(installer);
-    else response.writeHead(404).end();
+    else if (/^\/assets\/\d+$/.test(request.url!)) {
+      const content = [...assets.values()][Number(request.url!.split('/').at(-1)) - 2];
+      if (content) response.end(content);
+      else response.writeHead(404).end();
+    } else response.writeHead(404).end();
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-updates-'));
@@ -72,13 +84,70 @@ async function feed(t: TestContext, version: string, runtime = 1) {
       (state) => states.push(state),
     );
   };
-  return { directory, name, installer, manifest, requests, states, updates };
+  return { directory, name, installer, requests, states, updates, manifest, assets };
 }
 
 test('version comparison is numeric', () => {
   assert.equal(isNewer('0.10.0', '0.9.9'), true);
   assert.equal(isNewer('1.0.0', '1.0.0'), false);
   assert.equal(isNewer('0.2.1', '0.2.10'), false);
+});
+
+test('one release synchronizes Windows and both Mac architectures with atomic hash and size checks', async (t) => {
+  const f = await feed(t, serviceVersion(), 1, true);
+  const updates = f.updates();
+  t.after(() => updates.stop());
+  await updates.start();
+  for (const [name, content] of f.assets)
+    assert.deepEqual(readFileSync(join(f.directory, 'client', name)), content);
+  assert.equal(readdirSync(join(f.directory, 'client')).length, 5);
+  assert.ok(f.requests.every((request) => request.authorization === 'Bearer read-only-token'));
+});
+
+test('a corrupt or truncated download leaves no final or partial installer', async (t) => {
+  const f = await feed(t, serviceVersion());
+  f.assets.set(f.name, Buffer.from('bad'));
+  const updates = f.updates();
+  t.after(() => updates.stop());
+  await updates.start();
+  assert.deepEqual(readdirSync(join(f.directory, 'client')), []);
+});
+
+test('startup refuses a manifest whose version differs from the requested running-version tag', async (t) => {
+  const f = await feed(t, '99.0.0');
+  const updates = f.updates();
+  t.after(() => updates.stop());
+  await updates.start();
+  assert.equal(
+    f.requests.some((request) => request.url === '/assets/2'),
+    false,
+  );
+});
+
+test('existing client assets are revalidated before skipping a download', async (t) => {
+  const f = await feed(t, serviceVersion());
+  mkdirSync(join(f.directory, 'client'));
+  writeFileSync(join(f.directory, 'client', f.name), Buffer.alloc(f.installer.length, 0));
+  const updates = f.updates();
+  t.after(() => updates.stop());
+  await updates.start();
+  assert.deepEqual(readFileSync(join(f.directory, 'client', f.name)), f.installer);
+});
+
+test('manifest rejects duplicate assets, invalid size and inconsistent platform metadata', async (t) => {
+  const f = await feed(t, '99.0.0');
+  f.manifest.files.push(f.manifest.files[0]);
+  const updates = f.updates();
+  await updates.check();
+  assert.equal(updates.state.state, 'failed');
+  f.manifest.files.pop();
+  f.manifest.files[0].size = 0;
+  await updates.check();
+  assert.equal(updates.state.state, 'failed');
+  f.manifest.files[0].size = f.installer.length;
+  Object.assign(f.manifest.files[0], { platform: 'darwin', arch: 'x64', format: 'zip' });
+  await updates.check();
+  assert.equal(updates.state.state, 'failed');
 });
 
 test('a newer release is installable only where the runtime is recent enough', async (t) => {
@@ -148,6 +217,8 @@ test('an installer download that slows to a halt is continued on new connections
   };
   const ranges: (string | undefined)[] = [];
   let pages = 0;
+  let seen = 0;
+  let completion: Promise<void> | undefined;
   const server = createServer((request, response) => {
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     if (request.url === `/repos/owner/name/releases/tags/v${version}`) {
@@ -164,6 +235,10 @@ test('an installer download that slows to a halt is continued on new connections
     } else if (request.url === '/assets/1') response.end(JSON.stringify(manifest));
     else if (request.url === '/assets/2') {
       ranges.push(request.headers.range);
+      // A resumed request follows the writer's progress update; observe there,
+      // rather than sampling a transient value on a timer under parallel load.
+      seen = Math.max(seen, updates.preparing?.received ?? 0);
+      completion ??= updates.prepareInstaller();
       const start = Number(/^bytes=(\d+)-$/.exec(request.headers.range ?? '')?.[1] ?? 0);
       // The second connection delivers nothing at all; every other one sends 6,000 bytes and then goes quiet
       // without closing.
@@ -193,9 +268,7 @@ test('an installer download that slows to a halt is continued on new connections
   });
   updates.start();
   const target = join(directory, 'client', name);
-  let seen = 0;
   for (let attempt = 0; attempt < 500 && !existsSync(target); attempt++) {
-    seen = Math.max(seen, updates.preparing?.received ?? 0);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.deepEqual(readFileSync(target), installer);
@@ -209,7 +282,7 @@ test('an installer download that slows to a halt is continued on new connections
   ]);
   // While it was on its way, clients could be told how far it was; nothing is left to tell afterwards.
   assert.ok(seen >= 6000 && seen < installer.length);
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await completion;
   assert.equal(updates.preparing, undefined);
   assert.equal(existsSync(`${target}.part`), false);
 });

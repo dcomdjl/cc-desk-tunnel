@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import type { TestContext } from 'node:test';
 import { WebSocket } from 'ws';
 import { PROTOCOL_VERSION, serverMessageSchema } from '@cc-desk-tunnel/protocol';
-import type { ServerMessage, SessionEvent } from '@cc-desk-tunnel/protocol';
+import type { DeviceDescriptor, ServerMessage, SessionEvent } from '@cc-desk-tunnel/protocol';
 import { createProxyServer } from '../src/server.ts';
 import { SessionStore } from '../src/store.ts';
 import { serviceVersion } from '../src/updates.ts';
@@ -26,7 +26,7 @@ class Client {
       this.messages.push(serverMessageSchema.parse(JSON.parse(raw.toString()))),
     );
   }
-  async open(authToken = token, protocolVersion = PROTOCOL_VERSION) {
+  async open(authToken = token, protocolVersion = PROTOCOL_VERSION, device?: DeviceDescriptor) {
     await new Promise<void>((resolve, reject) => {
       this.socket.once('open', resolve);
       this.socket.once('error', reject);
@@ -37,10 +37,25 @@ class Client {
         token: authToken,
         protocolVersion,
         deviceName: this.computer.name,
+        ...(protocolVersion !== PROTOCOL_VERSION && device ? { device } : {}),
       }),
     );
-    this.socket.send(JSON.stringify({ type: 'device', id: this.computer.id }));
-    return this.wait((message) => message.type === 'ready' || message.type === 'connection.error');
+    this.socket.send(
+      JSON.stringify({
+        type: 'device',
+        id: device?.deviceId ?? this.computer.id,
+        platform: device?.platform,
+        arch: device?.arch,
+      }),
+    );
+    const reply = await this.wait(
+      (message) => message.type === 'ready' || message.type === 'connection.error',
+    );
+    if (reply.type === 'ready' && device) {
+      const asset = await this.wait((message) => message.type === 'client.release');
+      if (asset.type === 'client.release') return { ...reply, client: asset.client ?? undefined };
+    }
+    return reply;
   }
   send(command: object) {
     this.socket.send(JSON.stringify(command));
@@ -316,7 +331,7 @@ test('a session is worked on from its own computer; another one takes it over or
   const send = (client: Client, id = sessionId) =>
     client.request({ type: 'message.send', sessionId: id, text: '继续', scenario: 'chat' });
   const refused = await send(away);
-  assert.ok(refused.type === 'response' && !refused.ok && refused.code === 'other_device');
+  assert.ok(refused.type === 'response' && !refused.ok && refused.code === 'device_mismatch');
   assert.match(refused.message ?? '', /测试设备/);
   assert.equal(f.server.store.get(sessionId).events.length, 0);
 
@@ -350,7 +365,7 @@ test('a session is worked on from its own computer; another one takes it over or
       message.event.payload.status === 'completed',
   );
   const back = await send(desk);
-  assert.ok(back.type === 'response' && !back.ok && back.code === 'other_device');
+  assert.ok(back.type === 'response' && !back.ok && back.code === 'device_mismatch');
 });
 test('a connection that never said which computer it is can look but not work', async (t) => {
   const f = await fixture(t);
@@ -808,4 +823,58 @@ test('the newest client installer is announced on sign-in and downloads only wit
   });
   assert.equal(download.status, 200);
   assert.equal(await download.text(), 'installer bytes');
+});
+
+test('sign-in, version mismatch and authenticated downloads select the client platform and architecture', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-installers-'));
+  mkdirSync(join(directory, 'client'));
+  for (const [name, bytes] of [
+    ['CC-Desk-Tunnel-Setup-1.0.0-x64.exe', 'windows'],
+    ['CC-Desk-Tunnel-1.1.0-darwin-x64.zip', 'mac x64'],
+    ['CC-Desk-Tunnel-1.2.0-darwin-arm64.zip', 'mac arm64'],
+  ])
+    writeFileSync(join(directory, 'client', name), bytes);
+  const server = createProxyServer({ token, dataDir: directory });
+  const url = await server.listen(0);
+  const clients: Client[] = [];
+  t.after(async () => {
+    for (const client of clients) client.socket.terminate();
+    await server.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const mac: DeviceDescriptor = {
+    deviceId: randomUUID(),
+    platform: 'darwin',
+    arch: 'arm64',
+    shell: { kind: 'posix', path: '/bin/zsh' },
+    schedulesPath: '/Users/test/schedules.json',
+    capabilities: { exec: true, sftp: true },
+  };
+  for (const protocolVersion of [PROTOCOL_VERSION, PROTOCOL_VERSION - 1]) {
+    const client = new Client(url);
+    clients.push(client);
+    const reply = await client.open(token, protocolVersion, mac);
+    assert.ok((reply.type === 'ready' || reply.type === 'connection.error') && reply.client);
+    assert.equal(reply.client.platform, 'darwin');
+    assert.equal(reply.client.arch, 'arm64');
+    assert.equal(reply.client.format, 'zip');
+    assert.equal(reply.client.version, '1.2.0');
+  }
+  for (const [query, expected] of [
+    ['', 'windows'],
+    ['?platform=darwin&arch=arm64', 'mac arm64'],
+    ['?platform=darwin&arch=x64', 'mac x64'],
+  ]) {
+    const download = await fetch(`${url}/client/installer${query}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(download.status, 200);
+    assert.equal(await download.text(), expected);
+  }
+  for (const query of ['?platform=linux&arch=x64', '?platform=darwin&arch=ia32']) {
+    const download = await fetch(`${url}/client/installer${query}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(download.status, 404);
+  }
 });

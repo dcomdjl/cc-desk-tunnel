@@ -38,6 +38,8 @@ import { messageTime } from './messageTime.ts';
 import ConversationFind, { SearchExpanded } from './ConversationFind.tsx';
 import { IconButton, Menu } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
+import { toolAccessIssue } from '../electron/project-access.mjs';
+import type { ToolAccessIssue } from '../electron/project-access.mjs';
 
 const RichText = lazy(() => import('./RichText.tsx'));
 const Rich = ({ text }: { text: string }) => (
@@ -56,6 +58,8 @@ type Live = {
   reply: (tool: Tool, allowed: boolean, answers?: Record<string, string>) => void;
   // Absent while a fork cannot be made.
   edit?: (item: Text) => void;
+  inspectAccess?: (issue: ToolAccessIssue, returnFocus: HTMLElement) => void;
+  connected: boolean;
 };
 const icons: Record<Category, typeof Wrench> = {
   command: SquareTerminal,
@@ -102,6 +106,7 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
   const { category, verb, subject, added, removed, running, failed } = describe(tool, active);
   const Icon = icons[category];
   const approval = live.canApprove(tool);
+  const accessIssue = live.inspectAccess ? toolAccessIssue(tool) : null;
   // A question Claude asks is answered, not allowed or denied.
   const questions = tool.name === 'AskUserQuestion' ? questionsOf(tool.input) : null;
   if (approval && questions)
@@ -180,6 +185,19 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
               >
                 <Check />
                 允许
+              </button>
+            </div>
+          )}
+          {accessIssue && (
+            <div className="tool-access-recovery">
+              <p className="muted">工具未成功，检测文件访问可帮助排查。文件修改可能已部分完成。</p>
+              <button
+                type="button"
+                className="button secondary"
+                disabled={live.busy || !live.connected}
+                onClick={(event) => live.inspectAccess?.(accessIssue, event.currentTarget)}
+              >
+                检测项目访问
               </button>
             </div>
           )}
@@ -348,6 +366,7 @@ export default function Conversation({
   stop,
   edit,
   findRequest,
+  inspectAccess,
 }: {
   session: Session | undefined;
   events: SessionEvent[];
@@ -369,6 +388,7 @@ export default function Conversation({
     answers?: Record<string, string>,
   ) => void;
   edit?: (messageId: string, text: string) => void;
+  inspectAccess?: (issue: ToolAccessIssue, returnFocus: HTMLElement) => void;
 }) {
   const turns = useMemo(() => conversation(events), [events]);
   const background = session?.activeRun?.waiting === 'background';
@@ -418,6 +438,8 @@ export default function Conversation({
     return () => clearInterval(timer);
   }, [running]);
   const live: Live = {
+    connected,
+    inspectAccess,
     now,
     busy,
     canApprove: (tool) =>

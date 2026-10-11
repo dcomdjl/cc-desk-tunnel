@@ -34,7 +34,10 @@ function fixture(t) {
   }
   globalThis.WebSocket = Socket;
   const client = new ProxyClient();
-  client.connect('ws://127.0.0.1:1/ws', 'test-token-with-enough-characters');
+  client.connect('ws://127.0.0.1:1/ws', 'test-token-with-enough-characters', {
+    id: '00000000-0000-4000-8000-000000000000',
+    name: '测试',
+  });
   const socket = Socket.current;
   const now = new Date().toISOString();
   const sessions = Array.from({ length: 6 }, (_, index) => ({

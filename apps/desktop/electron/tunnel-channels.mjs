@@ -61,7 +61,7 @@ export function openChannels(
     channel.send(JSON.stringify({ type: 'tunnel.attach', connectionId, channelId, secret }));
     // The stream takes over the connection's frames from here, in the same tick, so no bytes are missed.
     const stream = createWebSocketStream(channel);
-    const local = connect(port, '127.0.0.1');
+    const local = connect({ port, host: '127.0.0.1', allowHalfOpen: true });
     const entry = { channel, local };
     open.add(entry);
     let unanswered = 0;

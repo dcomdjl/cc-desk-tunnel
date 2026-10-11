@@ -26,6 +26,7 @@ import {
 import type {
   AccountState,
   Command,
+  DeviceDescriptor,
   Device,
   EventPayload,
   ServerMessage,
@@ -44,6 +45,7 @@ import { readNativeSettings, updateNativeSettings } from './native-settings.ts';
 import type { NativeTerminal } from './native-terminal.ts';
 import { simulate } from './simulation.ts';
 import { SessionStore } from './store.ts';
+import type { PromptValues, SessionNotice } from './store.ts';
 import { Throttle } from './throttle.ts';
 import { Tunnel, sessionSsh, sessionSshPath } from './tunnel.ts';
 import type { TunnelOptions } from './tunnel.ts';
@@ -56,9 +58,11 @@ type Peer = {
   id: string;
   address: string;
   authenticated: boolean;
-  // The computer it is from: the name it signed in with, and the identity that follows in a frame of its own.
   name: string;
   device?: Device;
+  platform?: DeviceDescriptor['platform'];
+  arch?: DeviceDescriptor['arch'];
+  wantsTunnel?: boolean;
   tunnel?: Tunnel;
   registering: boolean;
   subscriptions: Set<string>;
@@ -77,6 +81,9 @@ export type Run = {
   approvals: Map<string, (allowed: boolean, answers?: Record<string, string>) => void>;
   cancelReason?: string;
   input?: NativeInput;
+  prompt?: PromptValues;
+  promptAcknowledged?: boolean;
+  notices?: Map<string, SessionNotice>;
   controls: { refresh?: () => Promise<void>; stopTask?: (taskId: string) => Promise<void> };
 };
 type Terminal = { id: string; sessionId: string; owner: Peer; process?: NativeTerminal };
@@ -92,7 +99,7 @@ export type ServerOptions = {
   tls?: { cert: Buffer; key: Buffer };
   reverseProxy?: boolean;
   host?: string;
-  // Where an administrator puts the Windows installer offered to clients; defaults to <dataDir>/client.
+  // Where an administrator puts installers offered to clients; defaults to <dataDir>/client.
   clientDir?: string;
   // How many native runs and terminals may be going at once, over all connections; by default what the
   // memory of this machine holds.
@@ -160,12 +167,27 @@ export function createProxyServer(options: ServerOptions) {
   }
 
   const handler: RequestListener = (request, response) => {
+    let url: URL;
+    try {
+      url = new URL(request.url ?? '/', 'http://localhost');
+    } catch {
+      response.writeHead(400).end();
+      return;
+    }
     if (request.method === 'GET' && request.url === '/health') {
       response.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       response.end(JSON.stringify({ status: 'ok', protocolVersion: PROTOCOL_VERSION, adapter }));
-    } else if (request.method === 'GET' && request.url === '/client/installer') {
+    } else if (request.method === 'GET' && url.pathname === '/client/installer') {
       // The same secret as the WebSocket: only a signed-in client can fetch the installer.
-      const release = releases.current;
+      const platform = url.searchParams.get('platform') ?? 'win32';
+      const arch = url.searchParams.get('arch') ?? 'x64';
+      const release =
+        ['win32', 'darwin', 'linux'].includes(platform) && ['x64', 'arm64'].includes(arch)
+          ? releases.select(
+              platform as DeviceDescriptor['platform'],
+              arch as DeviceDescriptor['arch'],
+            )
+          : undefined;
       const address = addressOf(request);
       if (throttle.blocked(address)) {
         response.writeHead(429, { 'Retry-After': throttle.blocked(address) }).end();
@@ -223,14 +245,23 @@ export function createProxyServer(options: ServerOptions) {
     if (!peer.device) throw new DomainError('device_unknown', '客户端没有报告设备标识。');
     return peer.device;
   }
+  function bindingOf(peer: Peer) {
+    return peer.tunnel?.ssh?.device ?? { ...deviceOf(peer), platform: peer.platform ?? 'win32' };
+  }
   // A session is worked on from the computer its project directory is on. One from before computers were
   // told apart becomes that of the first to use it.
   function onDevice(peer: Peer, session: Session) {
     const device = deviceOf(peer);
-    if (!session.device) updated(store.claim(session.id, device).id);
-    else if (session.device.id !== device.id)
+    if (options.claude && !peer.tunnel?.ssh)
+      throw new DomainError('execution_offline', '本机 SSH 尚未就绪。');
+    if (!session.device) {
+      if (options.claude && peer.tunnel?.ssh)
+        store.assertDevice(session.id, peer.tunnel.ssh.device);
+      else store.claim(session.id, device);
+      updated(session.id);
+    } else if (session.device.id !== device.id)
       throw new DomainError(
-        'other_device',
+        'device_mismatch',
         `此会话在设备“${session.device.name}”上。要在本机接着做，请先为它选择本机的项目目录，或把它分叉到本机。`,
       );
   }
@@ -258,6 +289,17 @@ export function createProxyServer(options: ServerOptions) {
     return event;
   }
   function emit(run: Run, payload: EventPayload) {
+    if (payload.type === 'message.delivery' && payload.status === 'received') {
+      if (run.prompt && !run.promptAcknowledged) {
+        store.acknowledgePrompt(run.sessionId, run.prompt);
+        run.promptAcknowledged = true;
+      }
+      const notice = run.notices?.get(payload.messageId);
+      if (notice) {
+        store.acknowledgeNotice(run.sessionId, notice);
+        run.notices?.delete(payload.messageId);
+      }
+    }
     record(run.sessionId, run.id, payload);
     if (payload.type === 'native.title' && store.get(run.sessionId).session.autoTitle)
       broadcast({
@@ -305,11 +347,14 @@ export function createProxyServer(options: ServerOptions) {
     try {
       const { session } = store.get(run.sessionId);
       const ssh = run.owner.tunnel!.ssh!;
-      const said = store.promptValues(run.sessionId);
+      const said = store.promptValues(run.sessionId, ssh.device);
+      run.prompt = said;
       const status = await runClaude(options.claude!, {
         sessionId: run.sessionId,
         nativeRoot: session.nativeRoot ?? session.id,
         projectPath: said.projectPath,
+        legacyPowershellPath: said.legacyPowershellPath,
+        legacyEnvironment: said.legacyEnvironment,
         permissionMode: session.permissionMode,
         model: session.model,
         effort: session.effort,
@@ -325,7 +370,10 @@ export function createProxyServer(options: ServerOptions) {
         dataDir: store.directory,
         resume: store.hasNativeContext(run.sessionId),
         signal: run.controller.signal,
-        ssh: sessionSsh(store.directory, run.sessionId, ssh),
+        ssh: {
+          ...sessionSsh(store.directory, run.sessionId, ssh),
+          device: said.device,
+        },
         emit: (event) => emit(run, event),
         approve: (toolId, waiting) => {
           if (run.controller.signal.aborted) return Promise.resolve({ allowed: false });
@@ -473,11 +521,11 @@ export function createProxyServer(options: ServerOptions) {
   // The terminal occupies its session like a run does, so other connections see it as busy.
   async function openTerminal(peer: Peer, command: CommandOf<'terminal.open'>, session: Session) {
     if (!options.claude) throw new DomainError('native_unavailable', '离线模拟不启动原生终端。');
-    if (terminals.has(command.sessionId) || runs.has(command.sessionId) || mutations.size)
-      throw new DomainError('native_busy', '请先结束这个会话的运行或会话管理，再打开终端。');
-    if (!peer.tunnel?.ssh) throw new DomainError('execution_offline', 'Windows SSH 尚未就绪。');
-    onDevice(peer, session);
+    if (login || mutations.size || runs.has(session.id) || terminals.has(session.id))
+      throw new DomainError('native_busy', '请先结束原生运行或会话管理，再打开终端。');
     room();
+    if (!peer.tunnel?.ssh) throw new DomainError('execution_offline', '本机 SSH 尚未就绪。');
+    store.assertDevice(session.id, peer.tunnel.ssh.device);
     const current: Terminal = { id: randomUUID(), sessionId: command.sessionId, owner: peer };
     terminals.set(current.sessionId, current);
     try {
@@ -581,7 +629,10 @@ export function createProxyServer(options: ServerOptions) {
   // copies: one through that message, then one of it up to the entry before its last.
   async function fork(peer: Peer, command: CommandOf<'session.fork'>, session: Session) {
     if (session.activeRun) throw new DomainError('run_active', '请先结束当前运行再分叉会话。');
-    const place = { device: deviceOf(peer), projectPath: command.projectPath };
+    const place = {
+      device: bindingOf(peer),
+      projectPath: command.projectPath,
+    };
     const existing = store.created(command.requestId);
     if (existing) return existing.id;
     const before = command.beforeMessageId
@@ -666,7 +717,7 @@ export function createProxyServer(options: ServerOptions) {
       active.input.assertWritable();
       peer.subscriptions.add(command.sessionId);
       emit(active, { type: 'message.user', messageId: command.requestId, text, scenario });
-      active.input.submit(command.requestId, store.notice(command.sessionId) + text);
+      queueInput(active, command.requestId, text);
       return;
     }
     if (options.claude && mutations.size)
@@ -674,10 +725,9 @@ export function createProxyServer(options: ServerOptions) {
     if (options.claude && !peer.tunnel?.ssh)
       throw new DomainError(
         'execution_offline',
-        'Windows SSH 尚未就绪，请通过桌面客户端重新建立连接。',
+        '本机 SSH 尚未就绪，请通过桌面客户端重新建立连接。',
       );
-    onDevice(peer, session);
-    room();
+    if (options.claude) store.assertDevice(session.id, peer.tunnel!.ssh!.device);
     peer.subscriptions.add(command.sessionId);
     const run: Run = {
       id: randomUUID(),
@@ -699,7 +749,7 @@ export function createProxyServer(options: ServerOptions) {
     emit(run, { type: 'run.status', status: 'running', connectionId: run.owner.id });
     // What Claude's system prompt no longer has right is told to it with this message; the transcript shows the
     // user's own text.
-    run.input?.submit(command.requestId, store.notice(command.sessionId) + text);
+    if (run.input) queueInput(run, command.requestId, text);
     track(
       options.claude
         ? native(run)
@@ -710,6 +760,11 @@ export function createProxyServer(options: ServerOptions) {
             finish: (status, reason) => finish(run, status, reason),
           }),
     );
+  }
+  function queueInput(run: Run, messageId: string, text: string) {
+    const notice = store.notice(run.sessionId, run.owner.tunnel?.ssh?.device, text, run.prompt);
+    (run.notices ??= new Map()).set(messageId, notice);
+    run.input!.submit(messageId, notice.text + text);
   }
   function controlRun(
     peer: Peer,
@@ -805,11 +860,13 @@ export function createProxyServer(options: ServerOptions) {
         return undefined;
       }
       case 'session.create': {
+        if (options.claude && !peer.device)
+          throw new DomainError('device_required', '请通过桌面客户端连接执行设备后再创建会话。');
         const session = store.create(
           command.requestId,
           command.title,
           command.projectPath,
-          deviceOf(peer),
+          bindingOf(peer),
         );
         peer.subscriptions.clear();
         peer.subscriptions.add(session.id);
@@ -850,6 +907,8 @@ export function createProxyServer(options: ServerOptions) {
         controlRun(peer, command);
         return command.sessionId;
     }
+    if (['message.send', 'session.compact', 'terminal.open'].includes(command.type))
+      onDevice(peer, session);
     if (terminals.has(command.sessionId))
       throw new DomainError('native_busy', '这个会话的原生终端开着，请先关闭终端再操作它。');
     if (
@@ -870,9 +929,11 @@ export function createProxyServer(options: ServerOptions) {
         });
         break;
       case 'session.move':
+        if (options.claude && !peer.tunnel?.ssh)
+          throw new DomainError('execution_offline', '本机 SSH 尚未就绪，请先重新建立执行连接。');
         broadcast({
           type: 'session.updated',
-          session: store.move(command.sessionId, command.projectPath, deviceOf(peer)),
+          session: store.move(command.sessionId, command.projectPath, bindingOf(peer)),
         });
         break;
       case 'session.delete':
@@ -889,10 +950,19 @@ export function createProxyServer(options: ServerOptions) {
     return command.sessionId;
   }
 
-  const installer = () =>
-    releases.current
-      ? (({ version, size, sha256 }) => ({ version, size, sha256 }))(releases.current)
+  const installer = (device?: Pick<DeviceDescriptor, 'platform' | 'arch'>) => {
+    const release = releases.select(device?.platform ?? 'win32', device?.arch ?? 'x64');
+    return release
+      ? (({ version, size, sha256, platform, arch, format }) => ({
+          version,
+          size,
+          sha256,
+          platform,
+          arch,
+          format,
+        }))(release)
       : undefined;
+  };
   // The first frame must authenticate; a desktop client also asks for its execution channel here.
   function authenticate(peer: Peer, value: unknown) {
     const auth = authSchema.safeParse(value);
@@ -921,16 +991,14 @@ export function createProxyServer(options: ServerOptions) {
         code: 'version_mismatch',
         message: `客户端与服务端（${version}）的版本不一致，需要升级其中一方。`,
         service: version,
-        client: held,
-        ...(held?.version !== version && updates?.preparing
-          ? { preparing: updates.preparing }
-          : {}),
+        client: installer(auth.data.device),
       });
       peer.socket.close(4002, 'Version mismatch');
       return false;
     }
     peer.authenticated = true;
     peer.name = auth.data.deviceName;
+    peer.wantsTunnel = auth.data.tunnel;
     send(peer, {
       type: 'ready',
       protocolVersion: PROTOCOL_VERSION,
@@ -939,11 +1007,37 @@ export function createProxyServer(options: ServerOptions) {
       model: options.claude?.model,
       version,
       update: updates?.state,
-      client: installer(),
+      client: installer(auth.data.device),
       sessions: store.list(),
     });
+    return true;
+  }
+  function registerDevice(
+    peer: Peer,
+    identity: {
+      id: string;
+      platform?: DeviceDescriptor['platform'];
+      arch?: DeviceDescriptor['arch'];
+    },
+  ) {
+    if (peer.device) {
+      if (
+        peer.device.id !== identity.id ||
+        peer.platform !== identity.platform ||
+        peer.arch !== identity.arch
+      )
+        peer.socket.close(4002, 'Device identity changed');
+      return;
+    }
+    peer.device = { id: identity.id, name: peer.name };
+    peer.platform = identity.platform;
+    peer.arch = identity.arch;
+    send(peer, {
+      type: 'client.release',
+      client: installer({ platform: peer.platform ?? 'win32', arch: peer.arch ?? 'x64' }) ?? null,
+    });
     // Every connection that asks has an execution channel of its own, to the computer it comes from.
-    if (auth.data.tunnel && options.tunnel) {
+    if (peer.wantsTunnel && options.tunnel) {
       peer.tunnel = new Tunnel(
         options.tunnel,
         store.directory,
@@ -1000,11 +1094,20 @@ export function createProxyServer(options: ServerOptions) {
     return true;
   }
   function registerTunnel(peer: Peer, credentials: TunnelCredentials) {
-    if (!peer.tunnel || peer.registering || credentials.connectionId !== peer.id) {
+    if (
+      !peer.tunnel ||
+      peer.registering ||
+      credentials.connectionId !== peer.id ||
+      !peer.device ||
+      credentials.device.deviceId !== peer.device.id ||
+      (peer.platform && credentials.device.platform !== peer.platform) ||
+      (peer.arch && credentials.device.arch !== peer.arch)
+    ) {
       peer.socket.close(4002, 'Inactive tunnel registration');
       return;
     }
     peer.registering = true;
+    credentials.device.name = peer.name;
     track(
       peer.tunnel
         .accept(credentials)
@@ -1016,7 +1119,7 @@ export function createProxyServer(options: ServerOptions) {
             type: 'connection.error',
             code: 'ssh_failed',
             message:
-              '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：常见于安全软件拦截了内置的 sshd.exe 或 PowerShell，请检查保护记录后重新连接。',
+              '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：请检查本机执行通道、Shell 与安全软件的保护记录后重新连接。',
           });
           peer.socket.close(4003, 'SSH probe failed');
         }),
@@ -1113,7 +1216,15 @@ export function createProxyServer(options: ServerOptions) {
     };
     peers.add(peer);
     const opened = Date.now();
-    const authTimer = setTimeout(() => socket.close(4001, 'Authentication timeout'), 5000);
+    const authTimer = setTimeout(() => {
+      if (peer.authenticated)
+        send(peer, {
+          type: 'connection.error',
+          code: 'device_required',
+          message: '客户端未提供设备身份，请重新连接。',
+        });
+      socket.close(peer.authenticated ? 4002 : 4001, 'Authentication timeout');
+    }, 5000);
     // A long unattended run should survive a brief network stall: only two pings in a row without an answer,
     // about 45 seconds of silence, end the connection.
     let missed = 0;
@@ -1154,7 +1265,7 @@ export function createProxyServer(options: ServerOptions) {
         greeted = true;
         const channel = (value as { type?: unknown } | null)?.type === 'tunnel.attach';
         if (channel ? attachChannel(peer, value) : authenticate(peer, value)) {
-          clearTimeout(authTimer);
+          if (channel || !peer.wantsTunnel) clearTimeout(authTimer);
           signedIn = true;
           throttle.leave(address);
         }
@@ -1167,13 +1278,14 @@ export function createProxyServer(options: ServerOptions) {
       }
       const identity = deviceIdentitySchema.safeParse(value);
       if (identity.success) {
-        peer.device = { id: identity.data.id, name: peer.name };
+        registerDevice(peer, identity.data);
+        clearTimeout(authTimer);
         // With the line written when it closes, this tells which computer a connection was and how long it held.
         if (!closing)
           console.log(
             `Connection ${peer.id.slice(0, 8)} opened: device "${peer.name}" (${identity.data.id.slice(0, 8)}) from ${address}`,
           );
-        for (const session of store.named(peer.device))
+        for (const session of store.named(deviceOf(peer)))
           broadcast({ type: 'session.updated', session });
         return;
       }

@@ -20,10 +20,13 @@ const compactDraft = /^[/\\](compact)?$/;
 
 // The branch the project's working tree is on, read from the project by the desktop; it is looked at again
 // whenever the window comes back to the front or a run ends, the moments it may have changed.
-function useBranch(path: string, running: boolean) {
+function useBranch(path: string, running: boolean, enabled: boolean) {
   const [branch, setBranch] = useState<string | null>(null);
   useEffect(() => {
-    if (!window.desktop) return;
+    if (!window.desktop || !enabled) {
+      setBranch(null);
+      return;
+    }
     let current = true;
     const read = () =>
       void window.desktop!.gitBranch(path).then(
@@ -36,12 +39,13 @@ function useBranch(path: string, running: boolean) {
       current = false;
       window.removeEventListener('focus', read);
     };
-  }, [path, running]);
-  return branch;
+  }, [path, running, enabled]);
+  return enabled ? branch : null;
 }
 
 export default function Composer({
   session,
+  localProject = true,
   projectName,
   chooseProject,
   draft,
@@ -69,6 +73,7 @@ export default function Composer({
   stop,
 }: {
   session: Session;
+  localProject?: boolean;
   // Absent for a session that belongs to no project.
   projectName: string | null;
   // Opens the list of projects the session can be moved to; absent while it cannot be moved.
@@ -102,7 +107,7 @@ export default function Composer({
   stop: () => void;
 }) {
   const input = useRef<HTMLTextAreaElement>(null);
-  const branch = useBranch(session.projectPath, !!session.activeRun);
+  const branch = useBranch(session.projectPath, !!session.activeRun, localProject);
   const [dropping, setDropping] = useState(false);
   useLayoutEffect(() => {
     // Grow with the draft; the stylesheet's max-height decides when scrolling takes over.

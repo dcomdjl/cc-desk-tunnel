@@ -1,17 +1,28 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { sshConfig, sessionSsh, Tunnel } from '../src/tunnel.ts';
+import { sshConfig, sessionSsh, sshProbeCommand, Tunnel } from '../src/tunnel.ts';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { connect } from 'node:net';
-import type { Socket } from 'node:net';
+import type { Server, Socket } from 'node:net';
 import { once } from 'node:events';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { TestContext } from 'node:test';
 import { remotePrompt } from '../src/claude.ts';
+import { execFileSync } from 'node:child_process';
+import type { DeviceDescriptor } from '@cc-desk-tunnel/protocol';
+
+const device: DeviceDescriptor = {
+  deviceId: randomUUID(),
+  platform: 'win32',
+  arch: 'x64',
+  shell: { kind: 'powershell', path: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' },
+  schedulesPath: 'C:\\Users\\test\\AppData\\Roaming\\CC Desk Tunnel\\schedules.json',
+  capabilities: { exec: true, sftp: true },
+};
 
 // A tunnel whose device is this test: each request for a channel is recorded, and `device.open` answers one
 // with a real WebSocket pair, handing the service's end to the tunnel as the service would.
@@ -99,22 +110,60 @@ test('commands share one SSH connection where the platform and the length of the
 test('context references native SSH configuration without inventing execution tools', () => {
   const prompt = remotePrompt(
     "D:\\中文 空格\\it's",
-    { configPath: '/private/ssh_config' },
+    {
+      configPath: '/private/ssh_config',
+      device,
+    },
     '0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11',
   );
-  assert.match(prompt, /ssh -F "\/private\/ssh_config" device /);
-  assert.match(
-    prompt,
-    /"%CC_DESK_TUNNEL_PWSH%" -NoLogo -NoProfile -NonInteractive -EncodedCommand/,
-  );
-  assert.match(prompt, /CC_DESK_TUNNEL_SCHEDULES/);
-  // Nothing of the device's own layout: where its programs and the client's files are is the device's to know.
-  assert.doesNotMatch(prompt, /pwsh\.exe|APPDATA/);
+  assert.ok(prompt.includes(JSON.stringify(device.schedulesPath)));
   assert.match(prompt, /0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11/);
   assert.match(prompt, /native Bash/);
   assert.match(prompt, /ssh -F/);
   assert.match(prompt, /it''s/);
   assert.doesNotMatch(prompt, /mcp__/);
+});
+test('POSIX probing executes the declared shell and guidance uses the actual platform and schedule path', () => {
+  const mac: DeviceDescriptor = {
+    ...device,
+    platform: 'darwin',
+    arch: 'arm64',
+    shell: { kind: 'posix', path: '/bin/sh' },
+    schedulesPath: '/Users/test/Library/Application Support/CC Desk Tunnel/schedules.json',
+  };
+  assert.equal(
+    execFileSync('/bin/sh', ['-c', sshProbeCommand(mac)], { encoding: 'utf8' }),
+    'CC_DESK_TUNNEL_SSH_READY\n',
+  );
+  const prompt = remotePrompt(
+    "/Users/test/项目 $HOME/it's",
+    { configPath: '/private/ssh_config', device: mac },
+    randomUUID(),
+  );
+  assert.match(prompt, /connected macOS computer/);
+  assert.match(prompt, /Shell: POSIX/);
+  assert.match(prompt, /device '<remote command>'/);
+  assert.ok(prompt.includes(JSON.stringify(mac.schedulesPath)));
+  assert.match(prompt, /cd -- '\/Users\/test\/项目 \$HOME\/it'\\''s'/);
+  assert.doesNotMatch(prompt, /PowerShell|cmd\.exe|%APPDATA%|Set-Location/);
+  const linux = { ...mac, platform: 'linux' as const };
+  assert.match(
+    remotePrompt('/home/test/project', { configPath: '/ssh', device: linux }, randomUUID()),
+    /connected Linux computer/,
+  );
+});
+test('Windows probing retains encoded PowerShell and both SSH aliases work for historical prompts', () => {
+  const command = sshProbeCommand(device);
+  assert.match(
+    command,
+    /^"C:\\Program Files\\PowerShell\\7\\pwsh\.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand /,
+  );
+  const script = Buffer.from(command.split(' ').at(-1)!, 'base64').toString('utf16le');
+  assert.match(script, /CC_DESK_TUNNEL_SSH_READY/);
+  assert.match(
+    sshConfig('/tmp/private', 1234, 'user', 'ssh-ed25519 AAAA').config,
+    /^Host device windows\n/,
+  );
 });
 test('a session keeps one SSH path, and so one system prompt, across reconnects', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'claude-session-ssh-'));
@@ -122,15 +171,15 @@ test('a session keeps one SSH path, and so one system prompt, across reconnects'
   const session = '0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11';
   const prompts = ['first', 'second'].map((connection) => {
     const configPath = join(directory, 'connections', connection, 'ssh_config');
-    const ssh = sessionSsh(directory, session, { configPath });
+    const ssh = sessionSsh(directory, session, { configPath, device });
     assert.equal(readFileSync(ssh.configPath, 'utf8'), `Include ${JSON.stringify(configPath)}\n`);
     return remotePrompt('D:\\work', ssh, session);
   });
   assert.equal(prompts[0], prompts[1]);
   assert.doesNotMatch(prompts[0]!, /connections/);
   assert.notEqual(
-    sessionSsh(directory, randomUUID(), { configPath: '/x' }).configPath,
-    sessionSsh(directory, session, { configPath: '/x' }).configPath,
+    sessionSsh(directory, randomUUID(), { configPath: '/x', device }).configPath,
+    sessionSsh(directory, session, { configPath: '/x', device }).configPath,
   );
 });
 test('the tunnel offers a secret of its own and compares it without leaking its length', async (t) => {
@@ -144,6 +193,29 @@ test('the tunnel offers a secret of its own and compares it without leaking its 
   assert.equal(first.tunnel.matches(second.offer.secret), false);
   assert.equal(first.tunnel.matches(first.offer.secret.slice(1)), false);
   assert.equal(first.tunnel.matches(''), false);
+});
+test('closing while the loopback listener is still binding settles startup and releases the port', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'claude-tunnel-start-'));
+  const tunnel = new Tunnel(
+    {},
+    directory,
+    randomUUID(),
+    () => true,
+    () => {},
+  );
+  const started = tunnel.start();
+  const rejected = assert.rejects(started, /Tunnel closed/);
+  // Retain the listener only to clean a leaked socket if the regression fails.
+  const listener = Reflect.get(tunnel, 'listener') as Server;
+  t.after(async () => {
+    if (listener.listening) await new Promise<void>((resolve) => listener.close(() => resolve()));
+    rmSync(directory, { recursive: true, force: true });
+  });
+  await tunnel.close();
+  await rejected;
+  assert.equal(listener.listening, false);
+  await assert.rejects(tunnel.start(), /Tunnel closed/);
+  assert.equal(existsSync(tunnel.directory), false);
 });
 test('an SSH connection asks for one channel and is joined to it byte for byte, both ways', async (t) => {
   const device = await harness(t);

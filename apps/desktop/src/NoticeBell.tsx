@@ -44,6 +44,7 @@ export default function NoticeBell({
         title="通知"
         aria-label={unread ? `通知（${unread} 条未读）` : '通知'}
         aria-expanded={open}
+        aria-haspopup="dialog"
         onClick={() => {
           setOpen((value) => !value);
           markRead();

@@ -57,19 +57,29 @@ export function Modal({
   title,
   onClose,
   children,
+  closeDisabled = false,
+  className,
+  returnFocus,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
+  closeDisabled?: boolean;
+  className?: string;
+  returnFocus?: HTMLElement;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     ref.current?.showModal();
-    return () => ref.current?.close();
-  }, []);
+    return () => {
+      ref.current?.close();
+      if (returnFocus?.isConnected && !returnFocus.matches(':disabled')) returnFocus.focus();
+    };
+  }, [returnFocus]);
   return (
     <dialog
       ref={ref}
+      className={className}
       onCancel={(event) => {
         event.preventDefault();
         onClose();
@@ -77,7 +87,7 @@ export function Modal({
     >
       <div className="dialog-heading">
         <h2>{title}</h2>
-        <IconButton title="关闭" onClick={onClose}>
+        <IconButton title="关闭" onClick={onClose} disabled={closeDisabled}>
           <X />
         </IconButton>
       </div>

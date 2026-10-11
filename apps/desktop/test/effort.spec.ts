@@ -13,6 +13,7 @@ test('effort drag previews continuously, saves on release and keeps the menu ope
     id: randomUUID(),
     title: '滑条回归',
     autoTitle: false,
+    platform: 'win32',
     projectPath: 'D:\\工作\\滑条回归',
     permissionMode: 'auto',
     model: 'test-model',

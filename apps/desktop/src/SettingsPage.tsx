@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type { ProxyClient } from './client.ts';
 import Help from './Help.tsx';
+import { isMac } from './platform.ts';
 import type { ConnectionForm } from './LoginPage.tsx';
 import { connectionWaits, setPrefs, usePrefs, waitRange } from './prefs.ts';
 import type { ConnectionWaits, NotifyKind } from './prefs.ts';
@@ -96,7 +97,7 @@ const waits: { step: keyof ConnectionWaits; title: string; detail: string }[] = 
   {
     step: 'ssh',
     title: '本机 SSH 服务启动',
-    detail: '域账号连不上域控制器、或安全软件扫描较慢时，启动会久一些',
+    detail: '检测开发环境或安全软件扫描较慢时，启动会久一些',
   },
   {
     step: 'ready',
@@ -147,11 +148,13 @@ function General({
   changeForm,
   workspaceRoot,
   chooseWorkspace,
+  refreshEnvironment,
 }: {
   form: ConnectionForm;
   changeForm: (values: Partial<ConnectionForm>) => void;
   workspaceRoot: string;
   chooseWorkspace: (reset: boolean) => void;
+  refreshEnvironment?: () => void;
 }) {
   const [closeToTray, setCloseToTray] = useState<boolean | null>(null);
   const { connection } = usePrefs();
@@ -169,7 +172,11 @@ function General({
             <div className="card">
               <Row
                 title="关闭窗口时留在后台"
-                detail="关闭只是收到托盘，连接和运行中的任务继续；在托盘图标上选“退出”才结束"
+                detail={
+                  isMac()
+                    ? '关闭窗口后连接和任务继续；点击 Dock 或菜单栏图标恢复，选择“退出”才结束'
+                    : '关闭只是收到托盘，连接和运行中的任务继续；在托盘图标上选“退出”才结束'
+                }
               >
                 <Switch
                   label="关闭窗口时留在后台"
@@ -201,7 +208,14 @@ function General({
             </div>
             <h2 className="page-heading">连接</h2>
             <div className="card">
-              <Row title="记住凭据" detail="服务凭据经当前 Windows 账户加密后保存在本机">
+              <Row
+                title="记住凭据"
+                detail={
+                  isMac()
+                    ? '服务凭据通过系统钥匙串加密后保存在本机'
+                    : '服务凭据经当前系统账户加密后保存在本机'
+                }
+              >
                 <Switch
                   label="记住凭据"
                   checked={form.remember}
@@ -220,6 +234,26 @@ function General({
                 />
               </Row>
             </div>
+            {isMac() && (
+              <>
+                <h2 className="page-heading">开发环境</h2>
+                <div className="card">
+                  <Row
+                    title="重新检测开发环境"
+                    detail="重新连接以读取登录 shell 的环境；请先结束运行中的任务"
+                  >
+                    <button
+                      type="button"
+                      className="button"
+                      disabled={!refreshEnvironment}
+                      onClick={refreshEnvironment}
+                    >
+                      重新检测
+                    </button>
+                  </Row>
+                </div>
+              </>
+            )}
             <h2 className="page-heading">连接等待时间</h2>
             <div className="card">
               {waits.map(({ step, title, detail }) => (
@@ -278,7 +312,7 @@ function Notices() {
               onChange={(enabled) => set({ enabled })}
             />
           </Row>
-          <Row title="提示音" detail="弹出系统通知时播放 Windows 的通知声音">
+          <Row title="提示音" detail="弹出系统通知时播放系统通知声音">
             <Switch
               label="提示音"
               checked={notify.sound}
@@ -413,6 +447,7 @@ export default function SettingsPage({
   changeForm,
   workspaceRoot,
   chooseWorkspace,
+  refreshEnvironment,
   version,
   service,
   adapterName,
@@ -431,6 +466,7 @@ export default function SettingsPage({
   changeForm: (values: Partial<ConnectionForm>) => void;
   workspaceRoot: string;
   chooseWorkspace: (reset: boolean) => void;
+  refreshEnvironment?: () => void;
   version: string;
   service: string | null;
   adapterName: string;
@@ -503,6 +539,7 @@ export default function SettingsPage({
             changeForm={changeForm}
             workspaceRoot={workspaceRoot}
             chooseWorkspace={chooseWorkspace}
+            refreshEnvironment={refreshEnvironment}
           />
         ) : section === 'notifications' ? (
           <Notices />

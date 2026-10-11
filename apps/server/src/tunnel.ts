@@ -7,15 +7,15 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { setTimeout as delay } from 'node:timers/promises';
 import { createWebSocketStream } from 'ws';
 import type { WebSocket } from 'ws';
-import type { ServerMessage, TunnelCredentials } from '@cc-desk-tunnel/protocol';
+import type { DeviceDescriptor, ServerMessage, TunnelCredentials } from '@cc-desk-tunnel/protocol';
 
 export type TunnelOptions = {
   // How long an SSH connection waits for the device to open its channel before it is dropped.
   pairMs?: number;
   // Tells whether a command reaches the device through the SSH configuration; `sshProbe` unless a test replaces it.
-  probe?: (configPath: string) => Promise<void>;
+  probe?: (configPath: string, device: DeviceDescriptor) => Promise<void>;
 };
-export type SshConnection = { configPath: string };
+export type SshConnection = { configPath: string; device: DeviceDescriptor };
 
 // SSH connections that may wait for their channel at once, and that may be open at once. Far above what one
 // device's commands need; they bound what a stray local process connecting to the port can make the device do.
@@ -38,12 +38,19 @@ export function sessionSsh(dataDir: string, sessionId: string, ssh: SshConnectio
   return { ...ssh, configPath };
 }
 
-// Runs what the system prompt tells Claude to run: the device's SSH service names its PowerShell in a variable.
-export function sshProbe(configPath: string) {
+export function shellQuote(value: string) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+export function sshProbeCommand(device: DeviceDescriptor) {
+  if (device.shell.kind === 'posix')
+    return `${shellQuote(device.shell.path)} -c ${shellQuote("printf '%s\\n' CC_DESK_TUNNEL_SSH_READY")}`;
   const script =
     "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output 'CC_DESK_TUNNEL_SSH_READY'; exit 0";
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
-  const command = `"%CC_DESK_TUNNEL_PWSH%" -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
+  return `"${device.shell.path}" -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
+}
+export function sshProbe(configPath: string, device: DeviceDescriptor) {
+  const command = sshProbeCommand(device);
   return new Promise<void>((resolve, reject) => {
     execFile(
       'ssh',
@@ -51,7 +58,7 @@ export function sshProbe(configPath: string) {
       { timeout: 20000, maxBuffer: 65536 },
       (error, stdout) => {
         if (error || !stdout.includes('CC_DESK_TUNNEL_SSH_READY'))
-          reject(new Error('Windows SSH / PowerShell probe failed.'));
+          reject(new Error('Device SSH / shell probe failed.'));
         else resolve();
       },
     );
@@ -77,7 +84,7 @@ export function sshConfig(
   return {
     knownHosts: `[127.0.0.1]:${port} ${hostPublicKey}\n`,
     config: [
-      // `device` is the name the system prompt gives; conversations begun before 0.2.11 know it as `windows`.
+      // Older session prompts use `windows`, including sessions explicitly moved to another platform.
       'Host device windows',
       '  HostName 127.0.0.1',
       `  Port ${port}`,
@@ -150,14 +157,28 @@ export class Tunnel {
     this.unexpectedClose = unexpectedClose;
   }
   async start(): Promise<Extract<ServerMessage, { type: 'tunnel.offer' }>> {
+    if (this.controller.signal.aborted) throw new Error('Tunnel closed');
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     // Nothing is read from an SSH connection until its channel is there to take it.
-    const listener = createServer({ pauseOnConnect: true }, (socket) => this.incoming(socket));
+    // A TCP EOF must let the WebSocket writer drain before its peer closes the reverse stream.
+    const listener = createServer({ pauseOnConnect: true, allowHalfOpen: true }, (socket) =>
+      this.incoming(socket),
+    );
     this.listener = listener;
     await new Promise<void>((resolve, reject) => {
-      listener.once('error', reject);
+      const failed = (error: Error) => {
+        listener.off('close', cancelled);
+        reject(error);
+      };
+      const cancelled = () => {
+        listener.off('error', failed);
+        reject(new Error('Tunnel closed'));
+      };
+      listener.once('error', failed);
+      listener.once('close', cancelled);
       listener.listen(0, '127.0.0.1', () => {
-        listener.off('error', reject);
+        listener.off('error', failed);
+        listener.off('close', cancelled);
         resolve();
       });
     });
@@ -220,15 +241,15 @@ export class Tunnel {
     for (let attempt = 0; attempt < 20; attempt++) {
       if (this.controller.signal.aborted) throw new Error('Tunnel closed');
       try {
-        await this.probe(configPath);
+        await this.probe(configPath, credentials.device);
         if (this.controller.signal.aborted) throw new Error('Tunnel closed');
-        this.ssh = { configPath };
+        this.ssh = { configPath, device: credentials.device };
         return;
       } catch {
         await delay(300, undefined, { signal: this.controller.signal });
       }
     }
-    throw new Error('Windows SSH readiness timed out');
+    throw new Error('Device SSH readiness timed out');
   }
   // Every SSH connection ends with the tunnel: those still waiting and those in use.
   close() {
@@ -236,7 +257,8 @@ export class Tunnel {
     this.controller.abort();
     this.closePromise = (async () => {
       const listener = this.listener;
-      const closed = listener?.listening
+      // close() also cancels a pending listen(); waiting for 'listening' first can leave a port orphaned.
+      const closed = listener
         ? new Promise<void>((resolve) => listener.close(() => resolve()))
         : undefined;
       for (const { socket } of this.waiting.values()) socket.destroy();

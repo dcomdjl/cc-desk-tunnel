@@ -91,7 +91,14 @@ test('control terminal launches the official CLI directly with remote guidance a
   const args = terminalArguments(
     { executable: '/native/claude', model: 'provider', settingsPath: '/private/provider.json' },
     { projectPath: 'D:\\项目', permissionMode: 'auto', model: null, effort: 'high' } as Session,
-    { configPath: '/private/ssh.conf' },
+    {
+      configPath: '/private/ssh.conf',
+      device: {
+        platform: 'win32',
+        shell: { kind: 'powershell', path: 'C:\\pwsh.exe' },
+        schedulesPath: 'C:\\schedules.json',
+      },
+    } as never,
   );
   assert.ok(args.includes('--append-system-prompt'));
   assert.ok(args.some((arg) => arg.includes('D:\\\\项目')));
@@ -105,7 +112,14 @@ test('control terminal launches the official CLI directly with remote guidance a
     terminalArguments(
       { executable: 'claude' },
       { projectPath: 'D:\\test', permissionMode: 'default' } as Session,
-      { configPath: '/ssh' },
+      {
+        configPath: '/ssh',
+        device: {
+          platform: 'win32',
+          shell: { kind: 'powershell', path: 'C:\\pwsh.exe' },
+          schedulesPath: 'C:\\schedules.json',
+        },
+      } as never,
     )[1],
     'manual',
   );

@@ -4,6 +4,17 @@ declare global {
     desktop?: {
       // Run from the source tree, not installed: the login page then also offers the simulation service.
       dev: boolean;
+      platform: 'win32' | 'darwin' | 'linux';
+      deviceInfo: () => Promise<import('./platform.ts').DeviceInfo>;
+      projectIdentities: (paths: string[]) => Promise<import('./platform.ts').ProjectIdentity[]>;
+      checkProject: (
+        path: string,
+        options?: { targetPath?: string; targetOperation?: 'read' | 'write' },
+      ) => Promise<import('./platform.ts').ProjectAccess>;
+      openPrivacySettings?: () => Promise<void>;
+      onMenuAction: (
+        callback: (action: import('./shortcuts.ts').Action | 'addProject') => void,
+      ) => () => void;
       chooseProject: () => Promise<string | null>;
       // Files to mention in a message; the paths of the ones chosen.
       chooseFiles: () => Promise<string[]>;

@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, posix, win32 } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { snapshotSchema, sessionSchema, terminalStatuses } from '@cc-desk-tunnel/protocol';
 import { DomainError } from './errors.ts';
 import type {
   Device,
   Effort,
+  DeviceDescriptor,
   EventPayload,
   HistoryPage,
   PermissionMode,
@@ -16,6 +17,71 @@ import type {
 } from '@cc-desk-tunnel/protocol';
 
 type StoredSession = SessionSnapshot & { createRequestId: string };
+export type PromptValues = {
+  projectPath: string;
+  device: DeviceDescriptor;
+  legacyPowershellPath?: string;
+  legacyEnvironment?: true;
+  afterCompaction?: true;
+};
+export type SessionNotice = {
+  text: string;
+  projectPath: string;
+  movedFrom?: string;
+  device?: DeviceDescriptor;
+  knownEnvironment?: string;
+  ownerId?: string;
+};
+const environment = (
+  device: Pick<DeviceDescriptor, 'platform' | 'shell'> & { schedulesPath?: string },
+) =>
+  JSON.stringify({
+    platform: device.platform,
+    shell: device.shell,
+    schedulesPath: device.schedulesPath,
+  });
+function knownDevice(prompt: NonNullable<Session['prompt']>) {
+  return (
+    prompt.toldDevice ??
+    prompt.device ??
+    (prompt.format === 'environment'
+      ? {
+          platform: 'win32' as const,
+          shell: { kind: 'powershell' as const, path: '%CC_DESK_TUNNEL_PWSH%' },
+          schedulesPath: '%CC_DESK_TUNNEL_SCHEDULES%',
+        }
+      : undefined) ??
+    (prompt.powershellPath
+      ? {
+          platform: 'win32' as const,
+          shell: {
+            kind: 'powershell' as const,
+            path: prompt.toldPowershellPath ?? prompt.powershellPath,
+          },
+        }
+      : undefined)
+  );
+}
+const platformName = (platform: DeviceDescriptor['platform']) =>
+  platform === 'win32' ? 'Windows' : platform === 'darwin' ? 'macOS' : 'Linux';
+type BoundDevice = (Device & { platform?: DeviceDescriptor['platform'] }) | DeviceDescriptor;
+const identityOf = (device: BoundDevice): Device =>
+  'deviceId' in device
+    ? { id: device.deviceId, name: device.name ?? platformName(device.platform) }
+    : { id: device.id, name: device.name };
+const platformOf = (device: BoundDevice) =>
+  'platform' in device ? (device.platform ?? 'win32') : 'win32';
+function assertProjectPath(projectPath: string, platform: DeviceDescriptor['platform']) {
+  const absolute =
+    platform === 'win32'
+      ? /^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(projectPath) && win32.isAbsolute(projectPath)
+      : posix.isAbsolute(projectPath);
+  if (!absolute || /[\0\r\n]/.test(projectPath))
+    throw new DomainError(
+      'invalid_project_path',
+      '项目目录必须是执行设备上的绝对路径，且不能含换行或空字符。',
+    );
+}
 const pageEvents = 1000;
 const pageBytes = 512 * 1024;
 
@@ -80,6 +146,7 @@ export class SessionStore {
     `);
     try {
       this.importJson();
+      this.migrateDeviceMetadata();
       this.restoreUpdatedAt();
       for (const session of this.list()) {
         if (!session.activeRun) continue;
@@ -208,6 +275,19 @@ export class SessionStore {
       .map((row) => sessionSchema.parse(JSON.parse(String(row.metadata))))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
+  private migrateDeviceMetadata() {
+    if (this.database.prepare("SELECT 1 FROM migrations WHERE name = 'device-contract-15'").get())
+      return;
+    this.database.exec('BEGIN');
+    try {
+      for (const session of this.list()) this.save(session);
+      this.database.prepare("INSERT INTO migrations VALUES ('device-contract-15')").run();
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
 
   get(sessionId: string): StoredSession {
     const row = this.database
@@ -261,7 +341,8 @@ export class SessionStore {
     return row ? (JSON.parse(String(row.data)) as SessionEvent) : undefined;
   }
 
-  create(requestId: string, title: string, projectPath: string, device: Device): Session {
+  create(requestId: string, title: string, projectPath: string, device?: BoundDevice): Session {
+    if (device) assertProjectPath(projectPath, platformOf(device));
     const row = this.database
       .prepare('SELECT metadata FROM sessions WHERE create_request_id = ?')
       .get(requestId);
@@ -269,7 +350,9 @@ export class SessionStore {
       const session = sessionSchema.parse(JSON.parse(String(row.metadata)));
       if (
         ((!session.autoTitle || title !== '新会话') && session.title !== title) ||
-        session.projectPath !== projectPath
+        session.projectPath !== projectPath ||
+        (device &&
+          (session.device?.id !== identityOf(device).id || session.platform !== platformOf(device)))
       )
         throw new DomainError('request_conflict', '请求 ID 已被其他内容使用。');
       return session;
@@ -280,7 +363,8 @@ export class SessionStore {
       title,
       autoTitle: title === '新会话',
       projectPath,
-      device,
+      platform: device ? platformOf(device) : 'win32',
+      ...(device ? { device: identityOf(device) } : {}),
       permissionMode: 'auto',
       model: null,
       effort: null,
@@ -318,16 +402,25 @@ export class SessionStore {
     id: string,
     title: string,
     native: boolean,
-    place: { device: Device; projectPath?: string },
+    place: { device: BoundDevice; projectPath?: string },
     beforeSequence?: number,
   ): Session {
     const { session: source } = this.get(sourceId);
+    if (
+      source.device &&
+      (source.device.id !== identityOf(place.device).id ||
+        source.platform !== platformOf(place.device)) &&
+      !place.projectPath
+    )
+      throw new DomainError('project_required', '分叉到另一设备前请明确选择本机项目目录。');
+    if (place.projectPath) assertProjectPath(place.projectPath, platformOf(place.device));
     const now = new Date().toISOString();
     const session: Session = {
       ...source,
       id,
       title,
-      device: place.device,
+      device: identityOf(place.device),
+      platform: platformOf(place.device),
       projectPath: place.projectPath ?? source.projectPath,
       autoTitle: false,
       nativeRoot: native ? (source.nativeRoot ?? source.id) : undefined,
@@ -335,6 +428,22 @@ export class SessionStore {
       updatedAt: now,
       activeRun: null,
     };
+    if (!native) {
+      session.prompt = undefined;
+      session.movedFrom = undefined;
+      session.movedFromPlatform = undefined;
+      session.movedFromDevice = undefined;
+    } else if (beforeSequence !== undefined && session.prompt) {
+      // A cut may exclude the inputs that confirmed the latest environment. Reannounce it against the
+      // stable system prompt instead of claiming that the truncated native history still contains them.
+      session.prompt = { ...session.prompt, toldDevice: undefined, toldPowershellPath: undefined };
+      const platform = session.prompt.device?.platform ?? 'win32';
+      session.movedFrom =
+        session.prompt.projectPath !== session.projectPath || platform !== session.platform
+          ? session.prompt.projectPath
+          : undefined;
+      session.movedFromPlatform = session.movedFrom ? platform : undefined;
+    }
     const events = this.events(sourceId, 0, beforeSequence).filter(
       ({ payload }) =>
         native || (payload.type !== 'native.session' && payload.type !== 'native.context'),
@@ -485,69 +594,178 @@ export class SessionStore {
     this.save(session);
     return session;
   }
-  // Points the session at a project directory on a computer, which may be another one than it was on. What
-  // Claude knows of either changes with the next message: `notice`.
-  move(sessionId: string, projectPath: string, device: Device) {
+  // Points the session at another project. Once Claude has been told a path, the one it knows is kept until
+  // the next message tells it of the move.
+  move(sessionId: string, projectPath: string, device?: BoundDevice) {
     const { session } = this.get(sessionId);
     if (session.activeRun) throw new DomainError('run_active', '请先结束当前运行再更换项目。');
-    if (session.projectPath === projectPath && session.device?.id === device.id) return session;
+    if (device) assertProjectPath(projectPath, platformOf(device));
+    if (
+      session.projectPath === projectPath &&
+      (!device ||
+        (session.device?.id === identityOf(device).id && session.platform === platformOf(device)))
+    )
+      return session;
+    if (session.prompt || this.hasNativeContext(sessionId)) {
+      const known = session.movedFrom ?? session.projectPath;
+      const platform = session.movedFromPlatform ?? session.platform;
+      const changedOwner = device && session.device?.id !== identityOf(device).id;
+      session.movedFrom =
+        known === projectPath && (!device || platform === platformOf(device)) && !changedOwner
+          ? undefined
+          : known;
+      session.movedFromDevice ??= changedOwner ? session.device?.id : undefined;
+      session.movedFromPlatform = session.movedFrom ? platform : undefined;
+    }
     session.projectPath = projectPath;
-    session.device = device;
+    if (device) {
+      session.device = identityOf(device);
+      session.platform = platformOf(device);
+    }
     session.updatedAt = new Date().toISOString();
     this.save(session);
     return session;
   }
-  // A session from before computers were told apart becomes that of the first one to use it, where it is.
+  // A legacy Windows session may claim its first Windows connection; all other changes require `move`.
+  assertDevice(sessionId: string, device: DeviceDescriptor) {
+    const { session } = this.get(sessionId);
+    if (session.device?.id === device.deviceId && session.platform === device.platform) {
+      assertProjectPath(session.projectPath, device.platform);
+      return;
+    }
+    if (!session.device && session.platform === 'win32' && device.platform === 'win32') {
+      assertProjectPath(session.projectPath, device.platform);
+      session.device = identityOf(device);
+      this.save(session);
+      return;
+    }
+    throw new DomainError(
+      'device_mismatch',
+      '会话属于另一台设备。请先更换项目，将会话明确迁移到当前设备后再运行。',
+    );
+  }
   claim(sessionId: string, device: Device) {
     const { session } = this.get(sessionId);
-    if (session.device) return session;
-    session.device = device;
-    if (session.prompt) {
-      session.prompt.device ??= device.id;
-      if (session.prompt.told) session.prompt.told.device ??= device.id;
+    if (!session.device) {
+      session.device = device;
+      this.save(session);
     }
-    this.save(session);
     return session;
   }
-  // A computer goes by the name it last signed in with, in every session that is on it.
   named(device: Device) {
-    const changed: Session[] = [];
-    for (const session of this.list())
-      if (session.device?.id === device.id && session.device.name !== device.name) {
-        session.device = device;
-        this.save(session);
-        changed.push(session);
-      }
-    return changed;
+    return this.list().filter((session) => {
+      if (session.device?.id !== device.id || session.device.name === device.name) return false;
+      session.device = device;
+      this.save(session);
+      return true;
+    });
   }
-  // The text that tells Claude what its system prompt no longer has right, to go in front of the user's next
-  // message: a project directory or a computer other than the one it knows, from the prompt or from an
-  // earlier notice. It is given out once.
-  notice(sessionId: string) {
+  // Preparing an input must not consume its reminders: only an SDK receipt confirms they reached Claude.
+  notice(
+    sessionId: string,
+    device?: DeviceDescriptor,
+    input?: string,
+    activePrompt?: PromptValues,
+  ): SessionNotice {
+    const { session } = this.get(sessionId);
+    // Native slash commands must start the input. They cannot acknowledge environment text they never saw.
+    if (input?.startsWith('/')) return { text: '', projectPath: session.projectPath };
+    if (session.prompt?.compacted && !activePrompt)
+      return { text: '', projectPath: session.projectPath };
+    let text = '';
+    if (session.movedFrom) {
+      const computer =
+        session.movedFromDevice && session.movedFromDevice !== session.device?.id
+          ? `another of their computers, ${JSON.stringify(session.device?.name)}. From now on the device is that computer: ${platformName(session.platform)}`
+          : `the connected ${platformName(session.platform)} computer`;
+      text += `[CC Desk Tunnel: the user explicitly moved this session to ${computer}. The project directory is now ${JSON.stringify(session.projectPath)} (it was ${JSON.stringify(session.movedFrom)}). From now on use the new directory as the project cwd, in place of the one given earlier. Files and processes of the earlier computer are not on this one unless you find them here.]\n\n`;
+    }
+    const said = session.prompt;
+    // Compaction only permits a new process to replace its prompt. Follow-ups in the process that
+    // compacted still use its original append-system-prompt and need any pending environment correction.
+    const known =
+      said && (!said.compacted || (activePrompt && !activePrompt.afterCompaction))
+        ? knownDevice(said)
+        : undefined;
+    const changed =
+      known &&
+      device &&
+      (known.platform !== device.platform ||
+        known.shell.path !== device.shell.path ||
+        ('schedulesPath' in known && known.schedulesPath !== device.schedulesPath));
+    if (changed && device) {
+      text += `[CC Desk Tunnel: the connected computer now runs ${platformName(device.platform)}. Its ${device.shell.kind === 'powershell' ? 'PowerShell' : 'POSIX shell'} executable is now ${JSON.stringify(device.shell.path)} (it was ${JSON.stringify(known.shell.path)}). Use this shell and its native quoting and path syntax for commands through the SSH alias device. The desktop schedule file is now ${JSON.stringify(device.schedulesPath)}. These values replace the environment instructions given earlier.]\n\n`;
+    }
+    return {
+      text,
+      projectPath: session.projectPath,
+      movedFrom: session.movedFrom,
+      ownerId: session.device?.id,
+      ...(changed && device ? { device, knownEnvironment: environment(known) } : {}),
+    };
+  }
+  acknowledgeNotice(sessionId: string, notice: SessionNotice) {
+    const { session } = this.get(sessionId);
+    let changed = false;
+    if (
+      notice.movedFrom &&
+      session.movedFrom === notice.movedFrom &&
+      session.device?.id === notice.ownerId &&
+      session.projectPath === notice.projectPath
+    ) {
+      session.movedFrom = undefined;
+      session.movedFromPlatform = undefined;
+      session.movedFromDevice = undefined;
+      changed = true;
+    }
+    const said = session.prompt;
+    const known = said && knownDevice(said);
+    if (said && known && notice.device && environment(known) === notice.knownEnvironment) {
+      said.toldDevice = notice.device;
+      changed = true;
+    }
+    if (changed) this.save(session);
+  }
+  // What the system prompt of a run says, given the device of the connection it runs on. A prompt
+  // that changes costs the whole conversation's prompt cache, so it stays what it first was — through moves
+  // and reconnects, which `notice` tells Claude of — until a compaction, which rewrites everything after
+  // the prompt anyway; the run after that says what is current.
+  promptValues(sessionId: string, device: DeviceDescriptor): PromptValues {
     const { session } = this.get(sessionId);
     const said = session.prompt;
-    if (!said || said.compacted) return '';
-    const known = said.told ?? said;
-    const device = session.device?.id;
-    if (known.projectPath === session.projectPath && known.device === device) return '';
-    said.told = { projectPath: session.projectPath, device };
-    this.save(session);
-    const paths = `The project directory is now ${JSON.stringify(session.projectPath)} (it was ${JSON.stringify(known.projectPath)}).`;
-    return known.device === device
-      ? `[CC Desk Tunnel: the user moved this session to another project on the device. ${paths} From now on use the new directory as the project directory, in place of the one given earlier.]\n\n`
-      : `[CC Desk Tunnel: the user now continues this session from another of their computers, ${JSON.stringify(session.device!.name)}. From now on the device is that computer: Windows. ${paths} What the earlier computer had, its files, paths and running processes, is not on this one unless you find it there.]\n\n`;
+    if (said && !said.compacted) {
+      if (said.format === 'environment')
+        return {
+          projectPath: said.projectPath,
+          device: said.device ?? device,
+          legacyEnvironment: true,
+        };
+      if (said.device) return { projectPath: said.projectPath, device: said.device };
+      if (said.powershellPath)
+        return { projectPath: said.projectPath, device, legacyPowershellPath: said.powershellPath };
+      return { projectPath: said.projectPath, device };
+    }
+    return {
+      projectPath: session.projectPath,
+      device,
+      ...(device.platform === 'win32' ? { legacyEnvironment: true as const } : {}),
+      ...(said?.compacted ? { afterCompaction: true as const } : {}),
+    };
   }
-  // What the system prompt of a run says. A prompt that changes costs the whole conversation's prompt cache,
-  // so it stays what it first was — through moves, which `notice` tells Claude of — until a compaction,
-  // which rewrites everything after the prompt anyway; the run after that says what is current.
-  promptValues(sessionId: string) {
+  acknowledgePrompt(sessionId: string, values: PromptValues) {
     const { session } = this.get(sessionId);
-    const said = session.prompt;
-    if (said && !said.compacted) return { projectPath: said.projectPath };
-    const now = { projectPath: session.projectPath, device: session.device?.id };
-    session.prompt = now;
+    if (
+      session.prompt &&
+      (!session.prompt.compacted || !values.afterCompaction) &&
+      (session.prompt.device || session.prompt.powershellPath || session.prompt.format)
+    )
+      return;
+    session.prompt = {
+      projectPath: values.projectPath,
+      device: values.device,
+      ...(values.legacyEnvironment ? { format: 'environment' as const } : {}),
+    };
     this.save(session);
-    return now;
   }
   compacted(sessionId: string) {
     const { session } = this.get(sessionId);

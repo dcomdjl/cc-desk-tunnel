@@ -20,6 +20,63 @@ const shot = (page: Page, name: string) =>
   page.screenshot({ path: resolve(screenshots, 'redesign', `${name}.png`) });
 const project = 'D:\\工作\\中文项目';
 
+test('notifications stay beside settings across pages and narrow sidebar layouts', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await login(page);
+  const rail = page.getByRole('navigation', { name: '页面', exact: true });
+  const bell = rail.getByRole('button', { name: '通知', exact: true });
+  const settings = rail.getByRole('button', { name: '设置与账号', exact: true });
+  const notices = page.getByRole('dialog', { name: '通知', exact: true });
+  await expect(page.locator('.sidebar-brand .notice-bell')).toHaveCount(0);
+  const bellBox = (await bell.boundingBox())!;
+  const settingsBox = (await settings.boundingBox())!;
+  expect(bellBox.x).toBe(settingsBox.x);
+  expect(bellBox.y + bellBox.height).toBeLessThan(settingsBox.y);
+  expect(bellBox.y).toBeGreaterThan(page.viewportSize()!.height / 2);
+
+  await bell.focus();
+  await page.keyboard.press('Enter');
+  await expect(notices).toContainText('暂无通知');
+  await expect(bell).toHaveAttribute('aria-expanded', 'true');
+  await page.keyboard.press('Escape');
+  await expect(notices).toBeHidden();
+  await expect(bell).toBeFocused();
+
+  await page.getByRole('button', { name: '收起侧栏', exact: true }).first().click();
+  await expect(page.locator('.sidebar')).toBeHidden();
+  await bell.click();
+  await expect(notices).toBeVisible();
+  await rail.getByRole('button', { name: '定时任务', exact: true }).click();
+  await expect(notices).toBeHidden();
+  await bell.click();
+  await expect(notices).toBeVisible();
+  await settings.click();
+  await page.getByRole('menuitem', { name: '设置', exact: true }).click();
+  await bell.click();
+  await expect(notices).toBeVisible();
+  await page.keyboard.press('Escape');
+
+  await rail.getByRole('button', { name: '会话', exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: '展开会话列表', exact: true }).click();
+  await bell.click();
+  await expect(notices).toBeVisible();
+  const popupBox = (await notices.boundingBox())!;
+  const narrowBellBox = (await bell.boundingBox())!;
+  expect(popupBox.x).toBeGreaterThan(narrowBellBox.x + narrowBellBox.width);
+  expect(popupBox.x + popupBox.width).toBeLessThanOrEqual(390 - 8);
+  expect(popupBox.y).toBeGreaterThanOrEqual(0);
+  expect(popupBox.y + popupBox.height).toBeLessThanOrEqual(
+    narrowBellBox.y + narrowBellBox.height + 1,
+  );
+  await expect(notices.getByText('暂无通知')).toBeInViewport();
+  await shot(page, '通知-底部入口-窄屏');
+  await bell.click();
+  await expect(notices).toBeHidden();
+});
+
 test('pages, side column, menus, pins, export, settings and the notice list', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -268,6 +325,7 @@ test('a run that goes on only for background tasks looks finished, lists them an
     id: randomUUID(),
     title: '后台渲染',
     autoTitle: false,
+    platform: 'win32',
     projectPath: 'D:\\工作\\渲染',
     permissionMode: 'auto',
     model: null,
@@ -371,6 +429,7 @@ test('approval modes are described where they are chosen, and models sit behind 
     id: randomUUID(),
     title: '输入区',
     autoTitle: false,
+    platform: 'win32',
     projectPath: 'D:\\工作\\输入区',
     permissionMode: 'auto',
     model: 'test-model',

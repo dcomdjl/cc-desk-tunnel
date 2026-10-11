@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
 import { isIP } from 'node:net';
 import { connect } from 'node:tls';
@@ -7,7 +8,7 @@ import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { WebSocket, WebSocketServer } from 'ws';
 import { serverMessageSchema, MAX_FRAME_BYTES } from '@cc-desk-tunnel/protocol';
-import { startWindowsSsh } from './windows-ssh.mjs';
+import { executionDescriptor, startLocalExecutor } from './local-executor.mjs';
 import { openChannels } from './tunnel-channels.mjs';
 import { httpProxy, openSocket } from './system-proxy.mjs';
 import { channelFailure, controlFailure } from './connect-errors.mjs';
@@ -38,55 +39,102 @@ export function connectionWaits(values) {
 // Starts TLS with the service, through the system's HTTP proxy when the Windows settings name one for it. The proxy
 // only relays bytes: the certificate is still the service's own and is judged as on a direct connection.
 // `route`, when given, is told the proxy that was used, for the words of a failure.
-async function connectService(address, config, resolveProxy, route) {
+async function connectService(address, config, resolveProxy, route, signal) {
+  signal?.throwIfAborted();
   const port = Number(address.port || 443);
-  const proxy = httpProxy(await resolveProxy?.(`https://${address.hostname}:${port}`));
+  const answer = resolveProxy
+    ? await new Promise((resolve, reject) => {
+        const cancel = () => reject(signal.reason);
+        signal?.addEventListener('abort', cancel, { once: true });
+        Promise.resolve()
+          .then(() => resolveProxy(`https://${address.hostname}:${port}`))
+          .then(resolve, reject)
+          .finally(() => signal?.removeEventListener('abort', cancel));
+      })
+    : undefined;
+  const proxy = httpProxy(answer);
+  signal?.throwIfAborted();
   if (route) route.proxy = proxy;
-  const socket = await openSocket(
-    proxy,
-    address.hostname,
-    port,
-    connectionWaits(config.waits).connect,
-  );
-  // Lets the system notice a path that has gone, where something on the way would otherwise drop a quiet
-  // connection without a word.
-  socket.setKeepAlive(true, 30000);
-  return connect({
-    socket,
-    servername: isIP(address.hostname) ? undefined : address.hostname,
-    ...controlTlsOptions(config),
-  });
+  const host = address.hostname.replace(/^\[|\]$/g, '');
+  const tcp = await openSocket(proxy, host, port, connectionWaits(config.waits).connect, signal);
+  try {
+    signal?.throwIfAborted();
+    const socket = connect({
+      socket: tcp,
+      servername: isIP(host) ? undefined : host,
+      ...controlTlsOptions(config),
+    });
+    const cancel = () => socket.destroy(signal.reason ?? new Error('Connection cancelled'));
+    signal?.addEventListener('abort', cancel, { once: true });
+    socket.once('close', () => signal?.removeEventListener('abort', cancel));
+    return socket;
+  } catch (error) {
+    tcp.destroy();
+    throw error;
+  }
 }
 // An HTTPS GET carrying the service token. A pinned certificate is checked once the connection stands and before
 // the request, and with it the token, is written to it.
-export async function authorizedGet(address, config, path, token, resolveProxy) {
-  const socket = await connectService(address, config, resolveProxy);
-  await new Promise((resolve, reject) => {
-    socket.once('secureConnect', () => {
-      if (
-        config.fingerprint &&
-        !certificateMatches(socket.getPeerCertificate().fingerprint256, config.fingerprint)
-      ) {
-        socket.destroy();
-        reject(new Error('服务证书指纹不匹配；未发送服务凭据。'));
-      } else resolve();
+export async function authorizedGet(address, config, path, token, resolveProxy, options = {}) {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(options.signal.reason ?? new Error('Download cancelled'));
+  const cleanup = () => {
+    clearTimeout(timer);
+    options.signal?.removeEventListener('abort', cancel);
+  };
+  const timer = setTimeout(
+    () => controller.abort(new Error('安装包连接或响应超时，请重试。')),
+    options.timeoutMs ?? connectionWaits(config.waits).connect,
+  );
+  options.signal?.addEventListener('abort', cancel, { once: true });
+  if (options.signal?.aborted) cancel();
+  let socket;
+  try {
+    socket = await connectService(address, config, resolveProxy, undefined, controller.signal);
+    await new Promise((resolve, reject) => {
+      const failed = (error) => {
+        socket.off('secureConnect', secured);
+        reject(error);
+      };
+      const secured = () => {
+        socket.off('error', failed);
+        if (
+          config.fingerprint &&
+          !certificateMatches(socket.getPeerCertificate().fingerprint256, config.fingerprint)
+        ) {
+          socket.destroy();
+          reject(new Error('服务证书指纹不匹配；未发送服务凭据。'));
+        } else resolve();
+      };
+      socket.once('secureConnect', secured);
+      socket.once('error', failed);
     });
-    socket.once('error', reject);
-  });
-  return new Promise((resolve, reject) => {
-    const download = request(
-      {
-        host: address.hostname,
-        path,
-        createConnection: () => socket,
-        headers: { Host: address.host, Authorization: `Bearer ${token}` },
-      },
-      resolve,
-    );
-    download.on('error', reject);
-    download.end();
-  });
+    return await new Promise((resolve, reject) => {
+      const download = request(
+        {
+          host: address.hostname,
+          path,
+          createConnection: () => socket,
+          signal: controller.signal,
+          headers: { Host: address.host, Authorization: `Bearer ${token}` },
+        },
+        (response) => {
+          clearTimeout(timer);
+          response.on('error', () => {});
+          response.once('close', cleanup);
+          resolve(response);
+        },
+      );
+      download.on('error', reject);
+      download.end();
+    });
+  } catch (error) {
+    cleanup();
+    socket?.destroy();
+    throw error;
+  }
 }
+
 export async function openProxyBridge(
   config,
   binaries,
@@ -104,16 +152,25 @@ export async function openProxyBridge(
     throw new Error('原生模式需要不含凭据的 WSS 地址。');
   // A malformed pin is refused here, before anything listens or connects.
   controlTlsOptions(config);
+  binaries.signal?.throwIfAborted();
+  const device = await executionDescriptor(binaries);
+  binaries.signal?.throwIfAborted();
   const waits = connectionWaits(config.waits);
   const log = binaries.log ?? (() => {});
   const heartbeatMs = binaries.heartbeatMs ?? 15000;
   const nonce = randomBytes(32).toString('hex');
   const server = createServer();
+  const sockets = new Set();
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
   let pair;
   // Kept for the installer download, which uses the same secret and certificate check as the connection.
   let token = '';
   let release;
+  const activeRuns = new Set();
   let closed = false;
   let closing;
   server.on('upgrade', (request, socket, head) => {
@@ -131,10 +188,12 @@ export async function openProxyBridge(
   wss.on('connection', (local) => {
     // CA verification completes at TLS handshake; explicit pins are checked before sending credentials.
     const route = { proxy: null };
+    const controller = new AbortController();
     const remote = new WebSocket(address, {
+      handshakeTimeout: waits.connect,
       // Node's HTTP client also takes the connection through this callback once it is ready.
       createConnection: (_options, created) => {
-        connectService(address, config, binaries.resolveProxy, route).then(
+        connectService(address, config, binaries.resolveProxy, route, controller.signal).then(
           (socket) => created(null, socket),
           created,
         );
@@ -143,7 +202,7 @@ export async function openProxyBridge(
     pair = {
       local,
       remote,
-      controller: new AbortController(),
+      controller,
       ssh: null,
       channels: null,
       preparing: null,
@@ -182,10 +241,13 @@ export async function openProxyBridge(
           // SSH traffic is already encrypted and does not compress.
           perMessageDeflate: false,
           createConnection: (_options, created) => {
-            connectService(address, config, binaries.resolveProxy).then(
-              (socket) => created(null, socket),
-              created,
-            );
+            connectService(
+              address,
+              config,
+              binaries.resolveProxy,
+              undefined,
+              controller.signal,
+            ).then((socket) => created(null, socket), created);
           },
         });
         channel.once('error', (error) => {
@@ -214,7 +276,7 @@ export async function openProxyBridge(
       });
     }
     function fail(message) {
-      if (!closed) log(`Connection given up: ${message}`);
+      if (closed) return;
       if (local.readyState === WebSocket.OPEN)
         local.send(JSON.stringify({ type: 'connection.error', code: 'tunnel_failed', message }));
       clearTimeout(timer);
@@ -255,6 +317,11 @@ export async function openProxyBridge(
           message.tunnel = true;
           token = String(message.token);
         }
+        if (message.type === 'device') {
+          if (message.id !== device.deviceId) throw new Error('Renderer device identity mismatch');
+          message.platform = device.platform;
+          message.arch = device.arch;
+        }
         if (verified && remote.readyState === WebSocket.OPEN) remote.send(JSON.stringify(message));
         else queue.push(JSON.stringify(message));
       } catch {
@@ -270,6 +337,17 @@ export async function openProxyBridge(
         fail('服务端的消息无法识别。\n客户端与服务端的版本可能不一致，请把两者升级到同一版本。');
         return;
       }
+      if (message.type === 'client.release') {
+        release = message.client ?? undefined;
+        if (nativeReady) nativeReady = { ...nativeReady, client: release };
+      }
+      if (message.type === 'ready') {
+        activeRuns.clear();
+        for (const session of message.sessions) if (session.activeRun) activeRuns.add(session.id);
+      } else if (message.type === 'session.updated') {
+        if (message.session.activeRun) activeRuns.add(message.session.id);
+        else activeRuns.delete(message.session.id);
+      } else if (message.type === 'session.deleted') activeRuns.delete(message.sessionId);
       // A service of another version refuses the connection but may still offer the installer for its own.
       if (message.type === 'connection.error' && message.client) release = message.client;
       if (message.type === 'connection.error')
@@ -280,9 +358,9 @@ export async function openProxyBridge(
           return;
         }
         offerReceived = true;
-        current.preparing = startWindowsSsh(
+        current.preparing = startLocalExecutor(
           message.connectionId,
-          binaries,
+          { ...binaries, device },
           current.controller.signal,
           fail,
           waits.ssh,
@@ -349,6 +427,7 @@ export async function openProxyBridge(
       pair?.channels?.close();
       await pair?.ssh?.close();
       for (const socket of wss.clients) socket.terminate();
+      for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => wss.close(resolve));
       await new Promise((resolve) => server.close(resolve));
       if (notify) onClosed();
@@ -361,32 +440,61 @@ export async function openProxyBridge(
   });
   // Fetches the installer the service announced and accepts it only if its hash matches. Works after the
   // connection closed, as it does when the service refused this client's version.
-  async function downloadInstaller(directory) {
+  async function downloadInstaller(directory, options) {
     if (!release || !token) throw new Error('服务端没有提供客户端安装包。');
     const expected = release;
-    const target = join(directory, `CC-Desk-Tunnel-Setup-${expected.version}-x64.exe`);
+    const platform = expected.platform ?? 'win32';
+    const arch = expected.arch ?? 'x64';
+    if (platform !== device.platform || arch !== device.arch)
+      throw new Error('服务端提供的安装包与本机平台或架构不符。');
+    const format = expected.format ?? 'exe';
+    const target = join(
+      directory,
+      `CC-Desk-Tunnel-${expected.version}-${platform}-${arch}.${format}`,
+    );
     const response = await authorizedGet(
       address,
       config,
-      '/client/installer',
+      expected.platform
+        ? `/client/installer?platform=${platform}&arch=${arch}`
+        : '/client/installer',
       token,
       binaries.resolveProxy,
+      options,
     );
     if (response.statusCode !== 200) {
       response.resume();
       throw new Error(`安装包下载失败（${response.statusCode}）。`);
     }
     const hash = createHash('sha256');
-    response.on('data', (chunk) => hash.update(chunk));
-    await pipeline(response, createWriteStream(target));
-    if (hash.digest('hex') !== expected.sha256) throw new Error('安装包校验失败，已放弃升级。');
-    return target;
+    let size = 0;
+    response.setTimeout(30000, () => response.destroy(new Error('安装包下载没有进展，请重试。')));
+    response.on('data', (chunk) => {
+      size += chunk.length;
+      hash.update(chunk);
+      if (size > expected.size) response.destroy(new Error('安装包大小与发布清单不符。'));
+    });
+    try {
+      await pipeline(response, createWriteStream(target, { flags: 'wx', mode: 0o600 }));
+      if (size !== expected.size || hash.digest('hex') !== expected.sha256)
+        throw new Error('安装包校验失败，已放弃升级。');
+    } catch (error) {
+      await rm(target, { force: true });
+      throw error;
+    }
+    return { path: target, release: expected };
   }
   return {
     url: `ws://127.0.0.1:${server.address().port}/bridge/${nonce}`,
     close,
     downloadInstaller,
-    // The installer the service last announced, if any.
-    release: () => release,
+    get release() {
+      return release;
+    },
+    hasActiveRuns: () => activeRuns.size > 0,
+    checkProject: (directory, options) => {
+      if (!pair?.ssh?.checkProject) throw new Error('本机执行端尚未就绪。');
+      return pair.ssh.checkProject(directory, options);
+    },
   };
 }

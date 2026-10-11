@@ -9,6 +9,7 @@ export type ConnectionForm = {
   // Desktop only: keep the token (encrypted for this Windows account) and connect on the next launch.
   remember: boolean;
   autoLogin: boolean;
+  notice?: string;
 };
 
 export default function LoginPage({

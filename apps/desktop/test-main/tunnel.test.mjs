@@ -21,12 +21,13 @@ import { openProxyBridge } from '../electron/proxy-bridge.mjs';
 const execute = promisify(execFile);
 const vendor = resolve('apps/desktop/vendor');
 const available =
-  process.platform === 'win32' &&
-  (await access(join(vendor, 'openssh/sshd.exe')).then(
-    () => true,
-    () => false,
-  ));
-const windows = (timeout = 60000) => ({ skip: !available, timeout });
+  process.platform === 'darwin' ||
+  (process.platform === 'win32' &&
+    (await access(join(vendor, 'openssh/sshd.exe')).then(
+      () => true,
+      () => false,
+    )));
+const supported = (timeout = 60000) => ({ skip: !available, timeout });
 // Run from inside an SSH session, as when Claude runs the tests on this computer, the environment carries the
 // state of that session's descriptors for OpenSSH's own children. The `ssh` and `scp` started here are not
 // those children, and would wait forever on descriptors they do not have.
@@ -34,6 +35,7 @@ for (const name of Object.keys(process.env))
   if (name.endsWith('_POSIX_FD_STATE')) delete process.env[name];
 // Named by its identifier: a domain account's name cannot be looked up while the domain is out of reach.
 const account =
+  process.platform === 'win32' &&
   available &&
   (
     await execute('pwsh.exe', [
@@ -55,7 +57,24 @@ $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=
 $certificate = $request.CreateSelfSigned([DateTimeOffset]::Now.AddDays(-1), [DateTimeOffset]::Now.AddDays(1))
 [IO.File]::WriteAllText('${keyPath}', $key.ExportPkcs8PrivateKeyPem())
 [IO.File]::WriteAllText('${certificatePath}', $certificate.ExportCertificatePem())`;
-  await execute('pwsh.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script]);
+  if (process.platform === 'win32')
+    await execute('pwsh.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script]);
+  else
+    await execute('/usr/bin/openssl', [
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-nodes',
+      '-keyout',
+      keyPath,
+      '-out',
+      certificatePath,
+      '-days',
+      '1',
+      '-subj',
+      '/CN=localhost',
+    ]);
   return { cert: await readFile(certificatePath), key: await readFile(keyPath) };
 }
 // Passes TCP connections on to `route(index)`, a port, in the order they arrive. The first of a bridge is its
@@ -112,7 +131,10 @@ async function service() {
   const directory = await mkdtemp(join(tmpdir(), 'tunnel-test-'));
   const tls = await certificate(directory);
   const token = `tunnel-test-${randomUUID()}`;
-  const dataDir = join(directory, 'data');
+  // A real Linux deployment uses a short /data path. macOS's per-user tmpdir
+  // exceeds the Unix socket path limit and otherwise silently skips multiplexing.
+  const dataDir =
+    process.platform === 'darwin' ? await mkdtemp('/tmp/cc-tunnel-') : join(directory, 'data');
   const server = createProxyServer({
     token,
     dataDir,
@@ -121,13 +143,14 @@ async function service() {
     tunnel: {
       // The service is made for Linux, where the login key it writes is private by its file mode. Here it runs
       // on Windows, whose `ssh` refuses a key that inherited access for anyone else from the temporary folder.
-      async probe(configPath) {
-        await execute(
-          'icacls.exe',
-          [join(dirname(configPath), 'identity'), '/inheritance:r', '/grant:r', `*${account}:F`],
-          { windowsHide: true },
-        );
-        return sshProbe(configPath);
+      async probe(configPath, device) {
+        if (process.platform === 'win32')
+          await execute(
+            'icacls.exe',
+            [join(dirname(configPath), 'identity'), '/inheritance:r', '/grant:r', `*${account}:F`],
+            { windowsHide: true },
+          );
+        return sshProbe(configPath, device);
       },
     },
   });
@@ -141,6 +164,7 @@ async function service() {
     server,
     async close() {
       await server.close();
+      if (process.platform === 'darwin') await rm(dataDir, { recursive: true, force: true });
       await rm(directory, { recursive: true, force: true });
     },
   };
@@ -149,13 +173,15 @@ const schedules = 'C:\\任务 目录\\schedules.json';
 // A device connected to the service through a forwarder, and what `ssh` on the service's machine can do with it.
 async function device(svc, { route = () => svc.port, binaries = {}, config = {} } = {}) {
   const forward = await forwarder(route);
+  const deviceId = binaries.deviceId ?? randomUUID();
   let closedByBridge = false;
   const bridge = await openProxyBridge(
     { url: `wss://127.0.0.1:${forward.port}/ws`, fingerprint: svc.fingerprint, ...config },
     {
       openssh: join(vendor, 'openssh'),
       powershell: 'pwsh.exe',
-      environment: { CC_DESK_TUNNEL_SCHEDULES: schedules },
+      deviceId,
+      schedulesPath: join(svc.directory, 'schedules.json'),
       ...binaries,
     },
     () => (closedByBridge = true),
@@ -172,11 +198,13 @@ async function device(svc, { route = () => svc.port, binaries = {}, config = {} 
       deviceName: '测试设备',
     }),
   );
-  local.send(JSON.stringify({ type: 'device', id: randomUUID() }));
+  local.send(JSON.stringify({ type: 'device', id: deviceId }));
   async function next(type, seconds = 40) {
     for (const deadline = Date.now() + seconds * 1000; Date.now() < deadline;) {
       const index = messages.findIndex((message) => message.type === type);
       if (index >= 0) return messages.splice(index, 1)[0];
+      if (type === 'ready' && messages.some((message) => message.type === 'connection.error'))
+        throw new Error(messages.find((message) => message.type === 'connection.error').message);
       await delay(20);
     }
     throw new Error(`Timed out waiting for ${type}: ${JSON.stringify(messages)}`);
@@ -195,18 +223,22 @@ async function device(svc, { route = () => svc.port, binaries = {}, config = {} 
     },
   };
 }
-const ps = (script) =>
-  `pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(
-    `$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);${script}`,
-    'utf16le',
-  ).toString('base64')}`;
+const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+const nodeCommand = (script) => `${quote(process.execPath)} -e ${quote(script)}`;
+const ps = (script, posix) =>
+  process.platform !== 'win32'
+    ? posix
+    : `pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(
+        `$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);${script}`,
+        'utf16le',
+      ).toString('base64')}`;
 const configOf = (svc, connectionId) =>
   join(svc.dataDir, 'connections', connectionId, 'ssh_config');
 function ssh(svc, connectionId, command, input) {
   return new Promise((done, fail) => {
     const child = execFile(
       'ssh',
-      ['-F', configOf(svc, connectionId), 'windows', command],
+      ['-F', configOf(svc, connectionId), 'device', command],
       { timeout: 60000, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer', windowsHide: true },
       (error, stdout, stderr) => (error ? fail(Object.assign(error, { stderr })) : done(stdout)),
     );
@@ -216,10 +248,16 @@ function ssh(svc, connectionId, command, input) {
 // A command that says its process ID and then waits; resolves once it has said it. Both ends are ended with
 // the test: the bundled SSH service leaves a command running when its connection goes, with or without a
 // tunnel in between, and only ends it with the connection of the whole device.
-async function sleeper(t, svc, connectionId) {
+async function sleeper(t, svc, connectionId, independent = false) {
   const child = spawn(
     'ssh',
-    ['-F', configOf(svc, connectionId), 'windows', ps('Write-Output $PID; Start-Sleep 120')],
+    [
+      '-F',
+      configOf(svc, connectionId),
+      ...(independent ? ['-o', 'ControlMaster=no', '-o', 'ControlPath=none'] : []),
+      'device',
+      ps('Write-Output $PID; Start-Sleep 120', 'echo $$; exec sleep 120'),
+    ],
     { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
   );
   const exited = new Promise((done) => child.once('close', (code) => done(code)));
@@ -269,7 +307,7 @@ after(async () => {
   await shared.svc?.close();
 });
 
-test('commands reach the device over the service address alone', windows(), async () => {
+test('commands reach the device over the service address alone', supported(), async () => {
   const { svc, dev, connectionId } = await connected();
   assert.equal(
     dev.messages.some((message) => message.type.startsWith('tunnel.')),
@@ -278,11 +316,14 @@ test('commands reach the device over the service address alone', windows(), asyn
   const output = await ssh(
     svc,
     connectionId,
-    ps("Write-Output '通道 成功'; [Console]::Error.Write('err'); exit 0"),
+    ps(
+      "Write-Output '通道 成功'; [Console]::Error.Write('err'); exit 0",
+      "printf '通道 成功\\n'; printf err >&2",
+    ),
   );
   assert.equal(output.toString().trim(), '通道 成功');
   await assert.rejects(
-    ssh(svc, connectionId, ps("[Console]::Error.Write('坏了'); exit 7")),
+    ssh(svc, connectionId, ps("[Console]::Error.Write('坏了'); exit 7", 'printf 坏了 >&2; exit 7')),
     (error) => {
       assert.equal(error.code, 7);
       assert.match(error.stderr.toString(), /坏了/);
@@ -291,28 +332,49 @@ test('commands reach the device over the service address alone', windows(), asyn
   );
   // What the client gave the SSH service for its commands to read is there for each of them.
   assert.equal(
-    (await ssh(svc, connectionId, ps('Write-Output $env:CC_DESK_TUNNEL_SCHEDULES')))
+    (
+      await ssh(
+        svc,
+        connectionId,
+        ps('Write-Output $env:CC_DESK_TUNNEL_SCHEDULES', 'printf "%s" "$CC_DESK_TUNNEL_SCHEDULES"'),
+      )
+    )
       .toString()
       .trim(),
-    schedules,
+    join(svc.directory, 'schedules.json'),
   );
-  // Each command had a connection of its own, and none is kept once it has finished.
-  assert.ok(dev.forward.links.length >= 3);
-  await until(() => dev.forward.channels().length === 0, 10, 'finished channels to close');
+  const multiplexed = (await readFile(configOf(svc, connectionId), 'utf8')).includes(
+    'ControlMaster auto',
+  );
+  assert.equal(dev.forward.links.length, multiplexed ? 2 : 4);
+  await until(
+    () => dev.forward.channels().length === (multiplexed ? 1 : 0),
+    10,
+    'command sessions finish while the shared connection remains',
+  );
 });
-test('commands started together each get through', windows(120000), async () => {
+test('commands started together each get through', supported(120000), async () => {
   const { svc, dev, connectionId } = await connected();
   // Four times what one address may hold in connections that have not signed in yet.
   const results = await Promise.all(
-    Array.from({ length: 16 }, (_, index) => ssh(svc, connectionId, ps(`Write-Output ${index}`))),
+    Array.from({ length: 16 }, (_, index) =>
+      ssh(svc, connectionId, ps(`Write-Output ${index}`, `echo ${index}`)),
+    ),
   );
   assert.deepEqual(
     results.map((output) => output.toString().trim()),
     Array.from({ length: 16 }, (_, index) => String(index)),
   );
-  await until(() => dev.forward.channels().length === 0, 10, 'finished channels to close');
+  const multiplexed = (await readFile(configOf(svc, connectionId), 'utf8')).includes(
+    'ControlMaster auto',
+  );
+  await until(
+    () => dev.forward.channels().length === (multiplexed ? 1 : 0),
+    10,
+    'parallel command sessions finish',
+  );
 });
-test('large output and input pass unchanged', windows(180000), async () => {
+test('large output and input pass unchanged', supported(180000), async () => {
   const { svc, connectionId } = await connected();
   // 48 MiB out of the device, each mebibyte filled with its own number.
   const megabytes = 48;
@@ -321,6 +383,9 @@ test('large output and input pass unchanged', windows(180000), async () => {
     connectionId,
     ps(
       `$out=[Console]::OpenStandardOutput(); $block=[byte[]]::new(1MB); for($i=0;$i -lt ${megabytes};$i++){ [Array]::Fill($block,[byte]($i+1)); $out.Write($block,0,$block.Length) }; $out.Flush()`,
+      nodeCommand(
+        `const fs=require("node:fs");for(let i=0;i<${megabytes};i++)fs.writeSync(1,Buffer.alloc(1024*1024,i+1));`,
+      ),
     ),
   );
   const expected = Buffer.alloc(megabytes * 1024 * 1024);
@@ -335,18 +400,21 @@ test('large output and input pass unchanged', windows(180000), async () => {
     connectionId,
     ps(
       '$hash=[Security.Cryptography.SHA256]::Create().ComputeHash([Console]::OpenStandardInput()); Write-Output ([Convert]::ToHexString($hash).ToLowerInvariant())',
+      nodeCommand(
+        'const crypto=require("node:crypto");const h=crypto.createHash("sha256");process.stdin.on("data",c=>h.update(c));process.stdin.on("end",()=>console.log(h.digest("hex")));',
+      ),
     ),
     input,
   );
   assert.equal(reported.toString().trim(), sha256(input));
 });
-test('files are copied both ways with scp', windows(180000), async (t) => {
+test('files are copied both ways with scp', supported(180000), async (t) => {
   const { svc, connectionId } = await connected();
   const directory = await mkdtemp(join(tmpdir(), 'tunnel-scp-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const content = randomBytes(12 * 1024 * 1024);
   await writeFile(join(directory, 'source.bin'), content);
-  const remote = (name) => `windows:${join(directory, name).replaceAll('\\', '/')}`;
+  const remote = (name) => `device:${join(directory, name).replaceAll('\\', '/')}`;
   const scp = (from, to) =>
     execute('scp', ['-q', '-F', configOf(svc, connectionId), from, to], {
       timeout: 120000,
@@ -356,64 +424,97 @@ test('files are copied both ways with scp', windows(180000), async (t) => {
   await scp(remote('there 副本.bin'), join(directory, 'back.bin'));
   assert.equal(sha256(await readFile(join(directory, 'back.bin'))), sha256(content));
 });
-test('ending the ssh command closes its channel', windows(), async (t) => {
-  const { svc, dev, connectionId } = await connected();
-  await until(() => dev.forward.channels().length === 0, 10, 'earlier channels to close');
-  const command = await sleeper(t, svc, connectionId);
-  assert.equal(dev.forward.channels().length, 1);
-  command.child.kill();
-  await command.exited;
-  await until(() => dev.forward.channels().length === 0, 10, 'its channel to close');
-});
 test(
-  'a channel cut on the way fails its command only; the next command opens a new one',
-  windows(),
+  'ending a command reclaims it while preserving the shared transport',
+  supported(),
   async (t) => {
     const { svc, dev, connectionId } = await connected();
-    await until(() => dev.forward.channels().length === 0, 10, 'earlier channels to close');
-    const cut = await sleeper(t, svc, connectionId);
-    const [channel] = dev.forward.channels();
-    const kept = await sleeper(t, svc, connectionId);
+    const baseline = dev.forward.channels().length;
+    const command = await sleeper(t, svc, connectionId);
+    command.child.kill();
+    await command.exited;
+    if (process.platform !== 'win32')
+      await until(() => !alive(command.pid), 10, 'the command process is reclaimed');
+    await until(
+      () => dev.forward.channels().length === baseline,
+      10,
+      'the persistent connection remains',
+    );
+    assert.equal(
+      (await ssh(svc, connectionId, ps('Write-Output survived', 'echo survived')))
+        .toString()
+        .trim(),
+      'survived',
+    );
+  },
+);
+test(
+  'a channel cut on the way fails its command only; the next command opens a new one',
+  supported(),
+  async (t) => {
+    const { svc, dev, connectionId } = await connected();
+    const baseline = dev.forward.channels().length;
+    const cut = await sleeper(t, svc, connectionId, true);
+    const channel = dev.forward.channels().at(-1);
+    const kept = await sleeper(t, svc, connectionId, true);
     channel.cut();
     assert.notEqual(await cut.exited, 0);
     assert.equal(
-      (await ssh(svc, connectionId, ps('Write-Output again'))).toString().trim(),
+      (await ssh(svc, connectionId, ps('Write-Output again', 'echo again'))).toString().trim(),
       'again',
     );
+    // Receiving the command's exit status precedes the transport's close handshake.
+    await until(
+      () => dev.forward.channels().length === baseline + 1,
+      10,
+      'the finished command channel to close',
+    );
     assert.equal(kept.child.exitCode, null);
-    assert.equal(dev.forward.channels().length, 1);
+    assert.equal(dev.forward.channels().length, baseline + 1);
     assert.equal(dev.local.readyState, WebSocket.OPEN);
   },
 );
 test(
   'a channel that goes silent is given up from both ends instead of hanging for good',
-  windows(150000),
+  supported(150000),
   async (t) => {
     const { svc, dev, connectionId } = await connected();
-    await until(() => dev.forward.channels().length === 0, 10, 'earlier channels to close');
-    const command = await sleeper(t, svc, connectionId);
-    const [channel] = dev.forward.channels();
+    const baseline = dev.forward.channels().length;
+    const command = await sleeper(t, svc, connectionId, true);
+    const channel = dev.forward.channels().at(-1);
     const started = Date.now();
     channel.stall();
     // ssh asks for a sign of life every 10 seconds and gives up after two unanswered ones.
     assert.notEqual(await command.exited, 0);
     const seconds = (Date.now() - started) / 1000;
     assert.ok(seconds > 15 && seconds < 60, `ssh gave up after ${seconds}s`);
-    assert.ok(channel.upstream.destroyed, 'the service closed its end once ssh was gone');
+    // TCP EOF drains queued WebSocket frames before ending the reverse stream. A stalled peer cannot
+    // complete that handshake, so ws applies its 30-second closeTimeout; allow scheduling margin.
+    await until(
+      () => channel.upstream.destroyed,
+      35,
+      'the service to close after the WebSocket handshake deadline',
+    );
     // The device's end hears nothing of that: it gives up after 45 seconds without an answer to its own asking.
     await until(() => channel.client.destroyed, 90, 'the device to give up the silent channel');
     assert.equal(
-      (await ssh(svc, connectionId, ps('Write-Output alive'))).toString().trim(),
+      (await ssh(svc, connectionId, ps('Write-Output alive', 'echo alive'))).toString().trim(),
       'alive',
     );
     assert.equal(dev.local.readyState, WebSocket.OPEN);
   },
 );
-test('channels take the system proxy the control connection takes', windows(), async (t) => {
+test('channels take the system proxy the control connection takes', supported(), async (t) => {
   const svc = await service();
-  t.after(() => svc.close());
+  let proxy;
+  let dev;
+  t.after(async () => {
+    await dev?.close();
+    if (proxy) await new Promise((done) => proxy.close(done));
+    await svc.close();
+  });
   const targets = [];
-  const proxy = createServer((socket) => {
+  proxy = createServer((socket) => {
     socket.once('data', (head) => {
       const target = /^CONNECT (\S+) HTTP/.exec(head.toString())?.[1];
       targets.push(target);
@@ -430,24 +531,25 @@ test('channels take the system proxy the control connection takes', windows(), a
   });
   proxy.listen(0, '127.0.0.1');
   await once(proxy, 'listening');
-  t.after(() => new Promise((done) => proxy.close(done)));
-  const dev = await device(svc, {
+  dev = await device(svc, {
     binaries: { resolveProxy: async () => `PROXY 127.0.0.1:${proxy.address().port}; DIRECT` },
   });
-  t.after(() => dev.close());
   const { connectionId } = await dev.next('ready');
   const before = targets.length;
   assert.equal(
-    (await ssh(svc, connectionId, ps('Write-Output proxied'))).toString().trim(),
+    (await ssh(svc, connectionId, ps('Write-Output proxied', 'echo proxied'))).toString().trim(),
     'proxied',
   );
-  assert.ok(targets.length > before, 'the command channel did not pass the proxy');
-  assert.ok(targets.length >= 3);
+  const multiplexed = (await readFile(configOf(svc, connectionId), 'utf8')).includes(
+    'ControlMaster auto',
+  );
+  assert.equal(targets.length, multiplexed ? before : before + 1);
+  assert.ok(targets.length >= 2, 'control and the reused command transport pass the proxy');
   assert.deepEqual([...new Set(targets)], [`127.0.0.1:${dev.forward.port}`]);
 });
 test(
   'a channel answered by another certificate ends the connection without seeing the secret',
-  windows(),
+  supported(),
   async (t) => {
     const svc = await service();
     t.after(() => svc.close());
@@ -479,7 +581,7 @@ test(
 );
 test(
   'disconnecting ends running commands and leaves nothing behind on either side',
-  windows(),
+  supported(),
   async (t) => {
     const svc = await service();
     t.after(() => svc.close());
@@ -504,14 +606,14 @@ test(
     const ready = await again.next('ready');
     assert.notEqual(ready.connectionId, connectionId);
     assert.equal(
-      (await ssh(svc, ready.connectionId, ps('Write-Output back'))).toString().trim(),
+      (await ssh(svc, ready.connectionId, ps('Write-Output back', 'echo back'))).toString().trim(),
       'back',
     );
   },
 );
 test(
   'a service that stops ends the connection and the commands it carried',
-  windows(),
+  supported(),
   async (t) => {
     const svc = await service();
     t.after(() => rm(svc.directory, { recursive: true, force: true }));

@@ -12,17 +12,28 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { WebSocket } from 'ws';
 import { PROTOCOL_VERSION, TUNNEL_CLOSE } from '@cc-desk-tunnel/protocol';
 import { createProxyServer } from '../src/server.ts';
+import type { DeviceDescriptor } from '@cc-desk-tunnel/protocol';
+
+const descriptor: DeviceDescriptor = {
+  deviceId: randomUUID(),
+  platform: 'win32',
+  arch: 'x64',
+  shell: { kind: 'powershell', path: 'C:\\pwsh.exe' },
+  schedulesPath: 'C:\\Users\\test\\schedules.json',
+  capabilities: { exec: true, sftp: true },
+};
 
 const token = 'channel-test-' + randomUUID();
 type Message = { type: string; [key: string]: unknown };
 
 // A service with the execution channel, and a device that signs in to it. The SSH probe is replaced: these
 // tests are about how connections are admitted and joined, and play both `ssh` and the SSH service themselves.
-async function fixture(t: TestContext, pairMs = 5000) {
+async function fixture(t: TestContext, pairMs = 5000, native = false) {
   const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-channel-'));
   const server = createProxyServer({
     token,
     dataDir: directory,
+    ...(native ? { claude: { executable: '/unused/claude' }, reverseProxy: true } : {}),
     tunnel: { pairMs, probe: async () => {} },
   });
   const url = (await server.listen(0)).replace('http', 'ws') + '/ws';
@@ -39,7 +50,7 @@ async function fixture(t: TestContext, pairMs = 5000) {
     return created;
   }
   // Signs in on a control connection; `next` waits for a message of one type.
-  async function signIn(tunnel = true) {
+  async function signIn(tunnel = true, executionDevice = descriptor) {
     const control = await socket();
     const messages: Message[] = [];
     control.on('message', (raw) => messages.push(JSON.parse(raw.toString())));
@@ -58,15 +69,23 @@ async function fixture(t: TestContext, pairMs = 5000) {
         protocolVersion: PROTOCOL_VERSION,
         deviceName: '测试',
         tunnel,
+        device: executionDevice,
       }),
     );
-    control.send(JSON.stringify({ type: 'device', id: randomUUID() }));
+    control.send(
+      JSON.stringify({
+        type: 'device',
+        id: executionDevice.deviceId,
+        platform: executionDevice.platform,
+        arch: executionDevice.arch,
+      }),
+    );
     const ready = await next('ready');
     return { control, messages, next, connectionId: ready.connectionId as string };
   }
   // A device whose tunnel is ready; `ssh()` connects as `ssh` on the service's machine would.
-  async function device() {
-    const signed = await signIn();
+  async function device(executionDevice = descriptor) {
+    const signed = await signIn(true, executionDevice);
     const offer = await signed.next('tunnel.offer');
     signed.control.send(
       JSON.stringify({
@@ -75,6 +94,7 @@ async function fixture(t: TestContext, pairMs = 5000) {
         username: 'user',
         privateKey: 'unused',
         hostPublicKey: 'ssh-ed25519 AAAA',
+        device: executionDevice,
       }),
     );
     await signed.next('tunnel.ready');
@@ -295,4 +315,197 @@ test('two devices are online at once, each with an execution channel of its own'
   second.control.close();
   first.ssh();
   assert.equal((await first.next('tunnel.open')).connectionId, first.connectionId);
+});
+
+test('older tunnel clients receive a version mismatch before the new device descriptor is required', async (t) => {
+  const f = await fixture(t);
+  for (const protocolVersion of [PROTOCOL_VERSION - 1, PROTOCOL_VERSION]) {
+    const control = await f.socket();
+    const messages: Message[] = [];
+    control.on('message', (raw) => messages.push(JSON.parse(raw.toString())));
+    control.send(
+      JSON.stringify({
+        type: 'auth',
+        token,
+        protocolVersion,
+        deviceName: '旧客户端',
+        tunnel: true,
+      }),
+    );
+    assert.equal(await f.closeCode(control), 4002);
+    assert.equal(
+      messages.find((message) => message.type === 'connection.error')?.code,
+      protocolVersion === PROTOCOL_VERSION ? 'device_required' : 'version_mismatch',
+    );
+  }
+});
+
+test('SSH registration cannot replace the authenticated device descriptor', async (t) => {
+  const f = await fixture(t);
+  const signed = await f.signIn();
+  await signed.next('tunnel.offer');
+  signed.control.send(
+    JSON.stringify({
+      type: 'tunnel.credentials',
+      connectionId: signed.connectionId,
+      username: 'user',
+      privateKey: 'unused',
+      hostPublicKey: 'ssh-ed25519 AAAA',
+      device: { ...descriptor, deviceId: randomUUID() },
+    }),
+  );
+  assert.equal(await f.closeCode(signed.control), 4002);
+  assert.equal(f.server.store.list().length, 0);
+});
+
+test('other-device history remains readable while message and terminal execution require explicit migration', async (t) => {
+  const f = await fixture(t, 5000, true);
+  const session = f.server.store.create(randomUUID(), 'Windows 历史', 'D:\\project', descriptor);
+  const mac: DeviceDescriptor = {
+    ...descriptor,
+    deviceId: randomUUID(),
+    platform: 'darwin',
+    arch: 'arm64',
+    shell: { kind: 'posix', path: '/bin/zsh' },
+    schedulesPath: '/Users/test/schedules.json',
+  };
+  const signed = await f.device(mac);
+  async function request(command: object) {
+    const requestId = randomUUID();
+    signed.control.send(JSON.stringify({ ...command, requestId }));
+    return signed.next('response');
+  }
+  assert.equal((await request({ type: 'session.subscribe', sessionId: session.id })).ok, true);
+  const snapshot = await signed.next('session.snapshot');
+  assert.equal((snapshot.session as { id: string }).id, session.id);
+  for (const command of [
+    { type: 'message.send', sessionId: session.id, text: '执行' },
+    { type: 'terminal.open', sessionId: session.id, cols: 80, rows: 24 },
+  ]) {
+    const response = await request(command);
+    assert.equal(response.ok, false);
+    assert.equal(response.code, 'device_mismatch');
+  }
+  assert.equal(f.server.store.snapshot(session.id).events.length, 0);
+  f.server.store.append(session.id, randomUUID(), {
+    type: 'native.session',
+    nativeSessionId: session.id,
+    model: 'test',
+    version: 'test',
+  });
+  const compact = await request({ type: 'session.compact', sessionId: session.id });
+  assert.equal(compact.ok, false);
+  assert.equal(compact.code, 'device_mismatch');
+  assert.equal(f.server.store.snapshot(session.id).events.length, 1);
+  assert.equal(
+    (
+      await request({
+        type: 'session.move',
+        sessionId: session.id,
+        projectPath: '/Users/test/project',
+      })
+    ).ok,
+    true,
+  );
+  const moved = f.server.store.get(session.id).session;
+  assert.equal(moved.device?.id, mac.deviceId);
+  assert.equal(moved.platform, 'darwin');
+  assert.equal(moved.projectPath, '/Users/test/project');
+  f.server.store.assertDevice(session.id, mac);
+  const created = await request({
+    type: 'session.create',
+    title: 'Mac 项目',
+    projectPath: '/Users/test/项目 e\u0301 ',
+  });
+  assert.equal(created.ok, true);
+  const newSession = f.server.store.get(String(created.sessionId)).session;
+  assert.equal(newSession.device?.id, mac.deviceId);
+  assert.equal(newSession.projectPath, '/Users/test/项目 e\u0301 ');
+  const changedPath = '/Users/test/迁移项目 ';
+  assert.equal(
+    (
+      await request({
+        type: 'session.move',
+        sessionId: newSession.id,
+        projectPath: changedPath,
+      })
+    ).ok,
+    true,
+  );
+  assert.equal(f.server.store.get(newSession.id).session.projectPath, changedPath);
+});
+
+test('creation and migration reject project paths from the other platform without changing session ownership', async (t) => {
+  const f = await fixture(t, 5000, true);
+  const session = f.server.store.create(randomUUID(), 'Windows 历史', 'D:\\project', descriptor);
+  const mac: DeviceDescriptor = {
+    ...descriptor,
+    deviceId: randomUUID(),
+    platform: 'darwin',
+    arch: 'arm64',
+    shell: { kind: 'posix', path: '/bin/zsh' },
+    schedulesPath: '/Users/test/schedules.json',
+  };
+  const signed = await f.device(mac);
+  for (const projectPath of ['D:\\project', 'relative/project', '/Users/test/\0project']) {
+    for (const command of [
+      { type: 'session.create', title: 'Mac 项目', projectPath },
+      { type: 'session.move', sessionId: session.id, projectPath },
+    ]) {
+      signed.control.send(JSON.stringify({ ...command, requestId: randomUUID() }));
+      const response = await signed.next('response');
+      assert.equal(response.ok, false);
+      assert.equal(response.code, 'invalid_project_path');
+    }
+  }
+  assert.deepEqual(f.server.store.get(session.id).session, session);
+  assert.equal(f.server.store.list().length, 1);
+});
+
+test('a native startup failure leaves migration reminders pending for the next accepted message', async (t) => {
+  const f = await fixture(t, 5000, true);
+  const session = f.server.store.create(randomUUID(), '迁移', 'D:\\project', descriptor);
+  f.server.store.acknowledgePrompt(session.id, f.server.store.promptValues(session.id, descriptor));
+  f.server.store.append(session.id, randomUUID(), {
+    type: 'native.session',
+    nativeSessionId: session.id,
+    model: 'test',
+    version: 'test',
+  });
+  const mac: DeviceDescriptor = {
+    ...descriptor,
+    deviceId: randomUUID(),
+    platform: 'darwin',
+    arch: 'arm64',
+    shell: { kind: 'posix', path: '/bin/zsh' },
+    schedulesPath: '/Users/test/schedules.json',
+  };
+  const signed = await f.device(mac);
+  f.server.store.move(session.id, '/Users/test/project', mac);
+  const pending = f.server.store.notice(session.id, mac);
+  signed.control.send(
+    JSON.stringify({
+      type: 'message.send',
+      requestId: randomUUID(),
+      sessionId: session.id,
+      text: '检查项目',
+    }),
+  );
+  assert.equal((await signed.next('response')).ok, true);
+  // There is no native CLI context on disk. The SDK cannot accept an input, so the service fails before query.
+  for (;;) {
+    const event = (await signed.next('session.event')).event as {
+      payload: { type: string; status?: string };
+    };
+    if (event.payload.type === 'run.status' && event.payload.status === 'failed') break;
+  }
+  assert.deepEqual(f.server.store.notice(session.id, mac), pending);
+  assert.equal(f.server.store.get(session.id).session.prompt?.toldDevice, undefined);
+  assert.ok(
+    f.server.store
+      .snapshot(session.id)
+      .events.some(
+        ({ payload }) => payload.type === 'message.delivery' && payload.status === 'not_sent',
+      ),
+  );
 });

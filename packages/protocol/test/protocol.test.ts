@@ -6,6 +6,9 @@ import {
   authSchema,
   commandSchema,
   eventSchema,
+  deviceDescriptorSchema,
+  tunnelCredentialsSchema,
+  sessionSchema,
   terminalControlSchema,
 } from '../src/index.ts';
 
@@ -23,6 +26,107 @@ test('protocol validates UTF-8 text, IDs and bounded input', () => {
   assert.equal(commandSchema.safeParse({ ...command, text: 'a'.repeat(16001) }).success, false);
   assert.equal(commandSchema.safeParse({ ...command, sessionId: 'not-an-id' }).success, false);
   assert.equal(commandSchema.safeParse({ ...command, token: 'unexpected' }).success, false);
+});
+
+test('project commands preserve significant POSIX whitespace and Unicode in absolute paths', () => {
+  const projectPath = '/Users/test/项目 e\u0301 ';
+  for (const command of [
+    { type: 'session.create', requestId: randomUUID(), title: '项目', projectPath },
+    { type: 'session.move', requestId: randomUUID(), sessionId: randomUUID(), projectPath },
+  ]) {
+    const parsed = commandSchema.parse(command);
+    assert.ok(parsed.type === 'session.create' || parsed.type === 'session.move');
+    assert.equal(parsed.projectPath, projectPath);
+    assert.equal(commandSchema.safeParse({ ...command, projectPath: ' ' }).success, false);
+  }
+});
+
+test('device descriptors enforce platform shell contracts and absolute executable and schedule paths', () => {
+  const device = {
+    deviceId: randomUUID(),
+    platform: 'darwin',
+    arch: 'arm64',
+    shell: { kind: 'posix', path: '/bin/zsh' },
+    schedulesPath: '/Users/test/Library/Application Support/CC Desk Tunnel/schedules.json',
+    capabilities: { exec: true, sftp: true },
+  };
+  assert.ok(deviceDescriptorSchema.safeParse(device).success);
+  assert.ok(
+    deviceDescriptorSchema.safeParse({ ...device, platform: 'linux', arch: 'x64' }).success,
+  );
+  for (const invalid of [
+    { ...device, deviceId: 'invalid' },
+    { ...device, platform: 'win32' },
+    { ...device, shell: { kind: 'powershell', path: '/bin/zsh' } },
+    { ...device, shell: { kind: 'posix', path: 'zsh' } },
+    { ...device, schedulesPath: 'schedules.json' },
+    { ...device, schedulesPath: '/tmp/schedules\n.json' },
+    { ...device, capabilities: { exec: true, sftp: false } },
+  ])
+    assert.equal(deviceDescriptorSchema.safeParse(invalid).success, false);
+  const windows = {
+    ...device,
+    platform: 'win32',
+    shell: { kind: 'powershell', path: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' },
+    schedulesPath: 'C:\\Users\\test\\schedules.json',
+  };
+  assert.ok(deviceDescriptorSchema.safeParse(windows).success);
+  assert.equal(
+    deviceDescriptorSchema.safeParse({
+      ...windows,
+      shell: { kind: 'powershell', path: 'C:\\bad"&command' },
+    }).success,
+    false,
+  );
+  const credentials = {
+    type: 'tunnel.credentials',
+    connectionId: randomUUID(),
+    username: 'user',
+    privateKey: 'test',
+    hostPublicKey: 'ssh-ed25519 AAAA',
+    device,
+  };
+  assert.ok(tunnelCredentialsSchema.safeParse(credentials).success);
+  assert.equal(
+    tunnelCredentialsSchema.safeParse({ ...credentials, powershellPath: 'C:\\pwsh.exe' }).success,
+    false,
+  );
+});
+
+test('unbound historical sessions parse as Windows without claiming the current device', () => {
+  const now = new Date().toISOString();
+  const session = sessionSchema.parse({
+    id: randomUUID(),
+    title: '旧会话',
+    projectPath: 'D:\\项目',
+    createdAt: now,
+    updatedAt: now,
+    activeRun: null,
+  });
+  assert.equal(session.platform, 'win32');
+  assert.equal(session.device?.id, undefined);
+});
+
+test('legacy device aliases normalize to one owner and conflicting owners are rejected', () => {
+  const now = new Date().toISOString();
+  const deviceId = randomUUID();
+  const value = {
+    id: randomUUID(),
+    title: '旧 Mac',
+    projectPath: '/Users/test/project',
+    platform: 'darwin',
+    deviceId,
+    createdAt: now,
+    updatedAt: now,
+    activeRun: null,
+  };
+  const normalized = sessionSchema.parse(value);
+  assert.equal(normalized.device?.id, deviceId);
+  assert.equal('deviceId' in normalized, false);
+  assert.equal(
+    sessionSchema.safeParse({ ...value, device: { id: randomUUID(), name: '不同设备' } }).success,
+    false,
+  );
 });
 
 test('authentication version and event ordering are explicit', () => {

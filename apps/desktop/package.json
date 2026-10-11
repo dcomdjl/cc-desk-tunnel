@@ -1,6 +1,6 @@
 {
   "name": "@cc-desk-tunnel/desktop",
-  "version": "0.2.11",
+  "version": "0.3.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -20,6 +20,7 @@
     "react-dom": "19.3.0",
     "react-markdown": "10.1.0",
     "remark-gfm": "4.0.1",
+    "ssh2": "1.17.0",
     "ws": "8.22.0"
   },
   "devDependencies": {

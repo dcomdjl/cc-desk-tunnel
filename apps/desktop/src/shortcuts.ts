@@ -1,4 +1,5 @@
 import type { Prefs } from './prefs.ts';
+import { isMac } from './platform.ts';
 
 // The window's keyboard shortcuts. They act only on key presses that reach this window while it is in front —
 // nothing is registered with the system — and the user can change each one or turn them all off.
@@ -37,7 +38,10 @@ const defaults: Record<Action, string> = {
 };
 // The combination an action answers to: the user's own, or the default; empty when the user removed it.
 export const keyFor = (prefs: Prefs, action: Action) =>
-  prefs.shortcuts.keys[action] ?? defaults[action];
+  (
+    prefs.shortcuts.keys[action] ??
+    (isMac() ? defaults[action].replace('Ctrl+', 'Meta+') : defaults[action])
+  ).replace(/(^|\+)Win(?=\+|$)/g, '$1Meta');
 
 const numpad: Record<string, string> = {
   NumpadAdd: 'Equal',
@@ -52,14 +56,14 @@ export function comboOf(event: KeyboardEvent | React.KeyboardEvent) {
     event.ctrlKey && 'Ctrl',
     event.altKey && 'Alt',
     event.shiftKey && 'Shift',
-    event.metaKey && 'Win',
+    event.metaKey && 'Meta',
     numpad[event.code] ?? event.code,
   ]
     .filter(Boolean)
     .join('+');
 }
 // A combination that would get in the way of typing is not accepted: it needs Ctrl, Alt or a function key.
-export const usable = (combo: string) => /(^|\+)(Ctrl|Alt|Win|F\d{1,2})(\+|$)/.test(combo);
+export const usable = (combo: string) => /(^|\+)(Ctrl|Alt|Meta|Win|F\d{1,2})(\+|$)/.test(combo);
 
 const names: Record<string, string> = {
   Equal: '=',
@@ -82,5 +86,11 @@ const names: Record<string, string> = {
 export const show = (combo: string) =>
   combo
     .split('+')
-    .map((part) => names[part] ?? part.replace(/^(Key|Digit)/, ''))
+    .map((part) =>
+      part === 'Meta' || part === 'Win'
+        ? isMac()
+          ? '⌘'
+          : 'Win'
+        : (names[part] ?? part.replace(/^(Key|Digit)/, '')),
+    )
     .join('+');

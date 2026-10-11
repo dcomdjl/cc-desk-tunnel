@@ -1,4 +1,6 @@
 import { CalendarClock, Download, MessagesSquare, Settings } from 'lucide-react';
+import NoticeBell from './NoticeBell.tsx';
+import type { Notifications } from './notifications.ts';
 import type { MenuPosition } from './ui.tsx';
 
 export type Page = 'chat' | 'schedules' | 'settings';
@@ -11,12 +13,16 @@ export default function Rail({
   update,
   openUpdate,
   openSettings,
+  notifications,
+  openSession,
 }: {
   page: Page;
   go: (page: Page) => void;
   update: string | null;
   openUpdate: (position: MenuPosition) => void;
   openSettings: (position: MenuPosition) => void;
+  notifications: Notifications;
+  openSession: (sessionId: string) => void;
 }) {
   const beside = (element: HTMLElement): MenuPosition => {
     const box = element.getBoundingClientRect();
@@ -55,6 +61,7 @@ export default function Rail({
           <Download />
         </button>
       )}
+      <NoticeBell notifications={notifications} open={openSession} />
       <button
         type="button"
         title="设置与账号"

@@ -11,12 +11,12 @@ import {
   X,
 } from 'lucide-react';
 import type { Session } from '@cc-desk-tunnel/protocol';
-import NoticeBell from './NoticeBell.tsx';
-import type { Notifications } from './notifications.ts';
 import { ago, folderName, isInside, pathKey } from './paths.ts';
 import { setPrefs, toggled, usePrefs } from './prefs.ts';
 import { IconButton } from './ui.tsx';
 import type { MenuPosition } from './ui.tsx';
+import type { DeviceInfo } from './platform.ts';
+import { belongsToDevice } from './platform.ts';
 
 function activity(session: Session) {
   if (!session.activeRun) return ago(Date.parse(session.updatedAt));
@@ -36,19 +36,25 @@ export default function Sidebar({
   busy,
   refreshing,
   terminalOpen,
-  notifications,
+  terminalActive,
   select,
   newSession,
   addProject,
   createInProject,
   sessionMenu,
   projectMenu,
+  device,
+  pathRevision,
+  devicePending,
 }: {
   sessions: Session[];
   // Sessions on the user's other computers: listed apart, by computer, and not part of any project here.
   elsewhere: Session[];
   selectedId: string | undefined;
   projects: string[];
+  device?: DeviceInfo | null;
+  pathRevision?: number;
+  devicePending?: boolean;
   // Sessions whose directory lies under one of these belong to no project and are listed on their own.
   workspaceRoots: string[];
   connected: boolean;
@@ -56,7 +62,7 @@ export default function Sidebar({
   refreshing: boolean;
   // This window's native terminal is open: it has the window until it is closed.
   terminalOpen: boolean;
-  notifications: Notifications;
+  terminalActive: boolean;
   select: (sessionId: string) => void;
   newSession: () => void;
   addProject: () => void;
@@ -72,9 +78,15 @@ export default function Sidebar({
     const plain: Session[] = [];
     const pinned: Session[] = [];
     const term = search.trim().toLowerCase();
+    const local = (session: Session) =>
+      !devicePending && (!device || belongsToDevice(session, device));
+    const sessionKey = (session: Session) =>
+      local(session)
+        ? pathKey(session.projectPath)
+        : `other:${session.device?.id ?? 'legacy-windows'}:${session.projectPath}`;
     for (const path of projects) grouped.set(pathKey(path), []);
     for (const session of sessions) {
-      const loose = isInside(session.projectPath, workspaceRoots);
+      const loose = local(session) && isInside(session.projectPath, workspaceRoots);
       const text = loose ? session.title : `${session.title} ${session.projectPath}`;
       if (!text.toLowerCase().includes(term)) continue;
       if (prefs.pinnedSessions.includes(session.id)) {
@@ -84,7 +96,7 @@ export default function Sidebar({
         plain.push(session);
         continue;
       }
-      const key = pathKey(session.projectPath);
+      const key = sessionKey(session);
       const members = grouped.get(key) ?? [];
       if (!prefs.pinnedSessions.includes(session.id)) members.push(session);
       grouped.set(key, members);
@@ -98,8 +110,9 @@ export default function Sidebar({
           key,
           path:
             projects.find((path) => pathKey(path) === key) ??
-            sessions.find((session) => pathKey(session.projectPath) === key)!.projectPath,
+            sessions.find((session) => sessionKey(session) === key)!.projectPath,
           sessions: members,
+          elsewhere: key.startsWith('other:'),
         }))
         .filter(
           (group) => group.sessions.length || !term || group.path.toLowerCase().includes(term),
@@ -107,14 +120,24 @@ export default function Sidebar({
         // Array.sort is stable: pinned projects come first, the rest keep their order.
         .sort((a, b) => first(a.key) - first(b.key)),
     };
-  }, [sessions, search, projects, workspaceRoots, prefs.pinnedSessions, prefs.pinnedProjects]);
+  }, [
+    sessions,
+    search,
+    projects,
+    workspaceRoots,
+    prefs.pinnedSessions,
+    prefs.pinnedProjects,
+    device,
+    devicePending,
+    pathRevision,
+  ]);
 
   const others = useMemo(() => {
     const term = search.trim().toLowerCase();
     const devices = new Map<string, { name: string; sessions: Session[] }>();
     for (const session of elsewhere) {
       if (!`${session.title} ${session.projectPath}`.toLowerCase().includes(term)) continue;
-      const device = session.device!;
+      const device = session.device ?? { id: 'legacy-windows', name: '历史 Windows' };
       const entry = devices.get(device.id) ?? { name: device.name, sessions: [] };
       entry.sessions.push(session);
       devices.set(device.id, entry);
@@ -201,7 +224,6 @@ export default function Sidebar({
     <aside className="sidebar" ref={aside}>
       <div className="sidebar-brand">
         <span className="brand">CC Desk Tunnel</span>
-        <NoticeBell notifications={notifications} open={select} />
         <IconButton
           title={searching ? '关闭搜索' : '搜索'}
           onClick={() => {
@@ -252,7 +274,7 @@ export default function Sidebar({
             <Plus />
           </IconButton>
         </div>
-        {groups.map(({ key, path, sessions: members }) => {
+        {groups.map(({ key, path, sessions: members, elsewhere }) => {
           // A search shows what it found, folded or not.
           const collapsed = !search.trim() && prefs.collapsedProjects.includes(key);
           const name = prefs.projectNames[key] || folderName(path);
@@ -262,7 +284,7 @@ export default function Sidebar({
                 title={path}
                 onContextMenu={(event) => {
                   event.preventDefault();
-                  projectMenu(path, { x: event.clientX, y: event.clientY });
+                  if (!elsewhere) projectMenu(path, { x: event.clientX, y: event.clientY });
                 }}
               >
                 <button
@@ -278,7 +300,10 @@ export default function Sidebar({
                   }
                 >
                   {collapsed ? <Folder /> : <FolderOpen />}
-                  <span>{name}</span>
+                  <span>
+                    {name}
+                    {elsewhere ? ' · 其他设备' : ''}
+                  </span>
                   {collapsed && members.some((session) => session.activeRun) && (
                     <i className="running-dot" />
                   )}
@@ -288,6 +313,7 @@ export default function Sidebar({
                 <IconButton
                   title={`项目操作 · ${path}`}
                   className="row-action"
+                  disabled={elsewhere}
                   onClick={(event) => {
                     const box = event.currentTarget.getBoundingClientRect();
                     projectMenu(path, { x: box.left, y: box.bottom + 4 });
@@ -298,7 +324,7 @@ export default function Sidebar({
                 <IconButton
                   title={`新建会话 · ${path}`}
                   className="row-action"
-                  disabled={!connected || busy || refreshing || terminalOpen}
+                  disabled={elsewhere || !connected || busy || refreshing || terminalActive}
                   onClick={() => createInProject(path)}
                 >
                   <Plus />

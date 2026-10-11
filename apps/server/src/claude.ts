@@ -5,6 +5,7 @@ import type { Query, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { Effort, EventPayload, NativeMetrics, PermissionMode } from '@cc-desk-tunnel/protocol';
 import { ClaudeStream } from './claude-stream.ts';
 import type { SshConnection } from './tunnel.ts';
+import { shellQuote } from './tunnel.ts';
 import { nativeCapabilities, nativeContextRefresh, nativeMetrics } from './native-controls.ts';
 import type { NativeInput } from './native-input.ts';
 import { readNativeSettings } from './native-settings.ts';
@@ -32,6 +33,8 @@ export type ClaudeRun = {
   // The session whose Linux directory holds this session's native history; itself unless it is a fork.
   nativeRoot: string;
   projectPath: string;
+  legacyPowershellPath?: string;
+  legacyEnvironment?: true;
   permissionMode: PermissionMode;
   model?: string | null;
   effort?: Effort | null;
@@ -53,7 +56,50 @@ export type ClaudeRun = {
   controls: { refresh?: () => Promise<void>; stopTask?: (taskId: string) => Promise<void> };
 };
 // `sessionId` is the proxy's name for the session, which a scheduled task needs to continue it.
-export function remotePrompt(projectPath: string, ssh: SshConnection, sessionId: string) {
+export function remotePrompt(
+  projectPath: string,
+  ssh: SshConnection,
+  sessionId: string,
+  legacyPowershellPath?: string,
+  legacyEnvironment = false,
+) {
+  if (legacyEnvironment) return environmentRemotePrompt(projectPath, ssh, sessionId);
+  if (legacyPowershellPath)
+    return legacyRemotePrompt(projectPath, ssh, sessionId, legacyPowershellPath);
+  const device = ssh.device;
+  const platform =
+    device.platform === 'win32' ? 'Windows' : device.platform === 'darwin' ? 'macOS' : 'Linux';
+  const shell = device.shell.kind === 'powershell' ? 'PowerShell 7' : 'POSIX';
+  const commands =
+    device.shell.kind === 'powershell'
+      ? [
+          `PowerShell executable on Windows: ${JSON.stringify(device.shell.path)}.`,
+          'The SSH login command is parsed by cmd.exe, not PowerShell. Invoke the quoted PowerShell executable directly; do not prefix it with the PowerShell & operator.',
+          'For robust quoting, encode a PowerShell script as UTF-16LE Base64 on Linux and pass -NoLogo -NoProfile -NonInteractive -EncodedCommand to that executable over SSH.',
+          `Begin project scripts with Set-Location -LiteralPath '${projectPath.replaceAll("'", "''")}'; use UTF-8 for console and file I/O.`,
+        ]
+      : [
+          `POSIX shell executable on ${platform}: ${JSON.stringify(device.shell.path)}.`,
+          'The SSH login command uses a POSIX shell. Use POSIX shell quoting (single quotes, with embedded single quotes escaped), and invoke the shell with -c for scripts. Use POSIX syntax and paths throughout.',
+          `Begin project scripts with cd -- ${shellQuote(projectPath)}; use UTF-8 for console and file I/O.`,
+        ];
+  return [
+    `The user and all their projects are on the connected ${platform} computer, NOT on this Linux host.`,
+    `${platform} project cwd: ${JSON.stringify(projectPath)}. Shell: ${shell}. Encoding: UTF-8.`,
+    `Use your native Bash tool to run standard OpenSSH: ssh -F ${JSON.stringify(ssh.configPath)} device '<remote command>'.`,
+    `The SSH configuration contains the loopback endpoint, identity and pinned host key. Do not print, read into conversation, or copy the private key.`,
+    ...commands,
+    'Use SSH for all user project reads, edits, searches and commands. Do not operate user projects with Linux Read/Edit tools.',
+    `This Linux host only runs Claude Code, proxy state and temporary attachments. There is no copy of the ${platform} project here.`,
+    `Never silently fall back to this Linux host when the connected ${platform} computer is unavailable. Report unknown results after interruption; do not automatically retry side effects.`,
+    'Commands may share one SSH connection and run concurrently. The POSIX client reclaims supervised process groups when a command ends; Windows does not reliably end every detached process. Stop long-lived processes explicitly and treat interrupted side effects as unknown.',
+    'For a long-running remote process such as a dev server or watcher, keep its SSH command running as a background Bash task and end that task to stop it.',
+    'A remote command that blocks holds the turn until its Bash timeout. Set a timeout sized to the work, and run anything that may wait indefinitely as a background Bash task.',
+    `The desktop client on ${platform} sends scheduled prompts by itself. When the user asks for a scheduled or recurring task, edit ${JSON.stringify(device.schedulesPath)} on the connected computer (UTF-8 JSON; its "说明" field documents the format; changes apply within seconds) rather than using cron tools on this host, which stop when the run ends. This session's ID for a task that continues it: ${sessionId}.`,
+  ].join('\n');
+}
+
+function environmentRemotePrompt(projectPath: string, ssh: SshConnection, sessionId: string) {
   return [
     "The user's projects are on their own computer, the device, NOT on this Linux host, which only runs Claude Code and has no copy of them.",
     `Device: Windows. Project directory: ${JSON.stringify(projectPath)}.`,
@@ -62,6 +108,32 @@ export function remotePrompt(projectPath: string, ssh: SshConnection, sessionId:
     'If the device is unreachable, say so; never fall back to this host. After an interruption report results as unknown; do not repeat side effects on your own.',
     'Commands may run concurrently. One that blocks holds the turn until its Bash timeout: size the timeout to the work, and run anything long-lived, such as a dev server or watcher, as a background Bash task. Ending an ssh command does not reliably end what it started on the device; stop that process on the device.',
     `Scheduled and recurring prompts are sent by the desktop client, not by cron on this host: edit the UTF-8 JSON file whose path is in the device's CC_DESK_TUNNEL_SCHEDULES environment variable (its "说明" field documents the format; changes apply within seconds). This session's ID for a task that continues it: ${sessionId}.`,
+  ].join('\n');
+}
+
+// Historical Windows sessions keep their original prompt bytes until compaction.
+function legacyRemotePrompt(
+  projectPath: string,
+  ssh: SshConnection,
+  sessionId: string,
+  powershellPath: string,
+) {
+  return [
+    'The user and all their projects are on the connected Windows computer, NOT on this Linux host.',
+    `Windows project cwd: ${JSON.stringify(projectPath)}. Shell: PowerShell 7. Encoding: UTF-8.`,
+    `Use your native Bash tool to run standard OpenSSH: ssh -F ${JSON.stringify(ssh.configPath)} windows '<remote command>'.`,
+    `The SSH configuration contains the loopback endpoint, identity and pinned host key. Do not print, read into conversation, or copy the private key.`,
+    `PowerShell executable on Windows: ${JSON.stringify(powershellPath)}.`,
+    'The SSH login command is parsed by cmd.exe, not PowerShell. Invoke the quoted PowerShell executable directly; do not prefix it with the PowerShell & operator.',
+    'For robust quoting, encode a PowerShell script as UTF-16LE Base64 on Linux and pass -NoLogo -NoProfile -NonInteractive -EncodedCommand to that executable over SSH.',
+    `Begin project scripts with Set-Location -LiteralPath '${projectPath.replaceAll("'", "''")}'; use UTF-8 for console and file I/O.`,
+    'Use SSH for all user project reads, edits, searches and commands. Do not operate user projects with Linux Read/Edit tools.',
+    'This Linux host only runs Claude Code, proxy state and temporary attachments. There is no copy of the Windows project here.',
+    'Never silently fall back to Linux when Windows is unavailable. Report unknown results after interruption; do not automatically retry side effects.',
+    "Each SSH command is its own session and several may run concurrently. Windows processes started by a command are terminated when that command's SSH session ends, so detaching on Windows does not keep them alive.",
+    'For a long-running Windows process such as a dev server or watcher, keep its SSH command running as a background Bash task and end that task to stop it.',
+    'A remote command that blocks holds the turn until its Bash timeout. Set a timeout sized to the work, and run anything that may wait indefinitely as a background Bash task.',
+    `The desktop client on Windows sends scheduled prompts by itself. When the user asks for a scheduled or recurring task, edit %APPDATA%\\CC Desk Tunnel\\schedules.json on Windows (UTF-8 JSON; its "说明" field documents the format; changes apply within seconds) rather than using cron tools on this host, which stop when the run ends. This session's ID for a task that continues it: ${sessionId}.`,
   ].join('\n');
 }
 
@@ -123,7 +195,13 @@ export async function runClaude(
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          append: remotePrompt(run.projectPath, run.ssh, run.sessionId),
+          append: remotePrompt(
+            run.projectPath,
+            run.ssh,
+            run.sessionId,
+            run.legacyPowershellPath,
+            run.legacyEnvironment,
+          ),
           snapshot: false,
         },
         ...(run.resume ? { resume: run.sessionId } : { sessionId: run.sessionId }),
@@ -151,8 +229,8 @@ export async function runClaude(
             return {
               behavior: 'deny',
               message: question
-                ? 'The Windows user declined to answer.'
-                : 'The Windows user denied or cancelled this request.',
+                ? 'The user declined to answer.'
+                : 'The user denied or cancelled this request.',
             };
           // The official tool takes the user's choices as `answers`, keyed by question text.
           return {

@@ -50,7 +50,20 @@ import LoginPage from './LoginPage.tsx';
 import type { ConnectionForm } from './LoginPage.tsx';
 import { exportSession } from './exportSession.ts';
 import { useNotifications } from './notifications.ts';
-import { folderName, isInside, isNewer, pathKey, withProject } from './paths.ts';
+import {
+  folderName,
+  isInside,
+  isNewer,
+  pathKey,
+  lexicalPathKey,
+  registerPathIdentities,
+  withProject,
+} from './paths.ts';
+import ProjectAccessDialog from './ProjectAccessDialog.tsx';
+import { checkProjectAccess } from './projectAccess.ts';
+import type { ToolAccessIssue } from '../electron/project-access.mjs';
+import type { DeviceInfo, ProjectAccess } from './platform.ts';
+import { belongsToDevice, isMac } from './platform.ts';
 import { getPrefs, setPrefs, toggled, usePrefs } from './prefs.ts';
 import { actions, comboOf, keyFor, show as comboText } from './shortcuts.ts';
 import type { Action } from './shortcuts.ts';
@@ -132,6 +145,36 @@ export function App() {
   }, [state.status]);
   const refreshed = useRef(new Set<string>());
   const [projects, setProjects] = useState(savedProjects);
+  const [device, setDevice] = useState<DeviceInfo | null>(null);
+  const deviceRead = useRef<Promise<DeviceInfo | null> | null>(null);
+  const readDevice = () =>
+    (deviceRead.current ??= window.desktop?.deviceInfo() ?? Promise.resolve(null));
+  const [access, setAccess] = useState<
+    | { kind: 'setup'; path: string; result: ProjectAccess; apply: (path: string) => Promise<void> }
+    | {
+        kind: 'diagnostic';
+        path: string;
+        result: ProjectAccess;
+        issue?: ToolAccessIssue;
+        sessionId?: string;
+        returnFocus?: HTMLElement;
+      }
+    | null
+  >(null);
+  const [pathRevision, setPathRevision] = useState(0);
+  useEffect(() => {
+    let active = true;
+    void readDevice()
+      .then((info) => {
+        if (active) setDevice(info);
+      })
+      .catch(() => {
+        if (active) setError('无法读取本机设备身份，请重新启动客户端。');
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
   // The folders that hold sessions without a project; new ones are made in the first.
   const [workspaceRoots, setWorkspaceRoots] = useState<string[]>([]);
   const [drafts, setDraft] = useDrafts();
@@ -172,11 +215,19 @@ export function App() {
   const nativeMode = state.adapter === 'claude-code';
   const connected = state.status === 'connected';
   const selected = state.sessions.find((session) => session.id === state.selectedId);
-  // What is listed and managed here is what is on this computer. Sessions on the user's other computers are
-  // shown apart: they can be read, and taken over or forked into a directory here.
-  const sessions = state.sessions.filter((session) => isHere(session, state.device));
-  const elsewhere = state.sessions.filter((session) => !isHere(session, state.device));
-  const away = !!selected && !isHere(selected, state.device);
+  const localDevice =
+    device ??
+    (!window.desktop && state.device
+      ? { deviceId: state.device.id, platform: 'win32' as const, arch: 'x64' as const }
+      : null);
+  const onThisDevice = (session: Session) =>
+    nativeMode ? belongsToDevice(session, localDevice) : isHere(session, state.device);
+  const sessions = state.sessions.filter(onThisDevice);
+  const elsewhere = state.sessions.filter((session) => !onThisDevice(session));
+  const selectedElsewhere = !!selected && !onThisDevice(selected);
+  useEffect(() => {
+    setAccess(null);
+  }, [state.connectionId, state.status, state.selectedId]);
   const events = selected ? (state.events[selected.id] ?? []) : [];
   const history = selected ? state.history[selected.id] : undefined;
   const nativeSession = latest(events, 'native.session');
@@ -206,6 +257,7 @@ export function App() {
   const ownsRun = !!selected?.activeRun && selected.activeRun.connectionId === state.connectionId;
   // A native run accepts follow-up messages from the connection that owns it.
   const inputDisabled =
+    selectedElsewhere ||
     !connected ||
     busy ||
     !!history?.loading ||
@@ -305,11 +357,12 @@ export function App() {
       // The installed client has no simulation mode, whatever an earlier version saved.
       const restored = window.desktop!.dev ? saved : { ...saved, mode: 'remote' as const };
       setForm(restored);
+      if (restored.notice) setError(restored.notice);
       if (restored.autoLogin) void login(restored);
     });
   }, []);
   useEffect(() => {
-    if (connected) void window.desktop?.saveLogin(form);
+    if (connected) void window.desktop?.saveLogin(form).catch((error) => setError(error.message));
   }, [connected, form.remember, form.autoLogin]);
   useEffect(() => {
     const close = () => client.disconnect();
@@ -342,6 +395,48 @@ export function App() {
   useEffect(() => {
     localStorage.setItem('proxy-projects', JSON.stringify(projects));
   }, [projects]);
+  useEffect(() => {
+    if (!window.desktop) return;
+    let cancelled = false;
+    const paths = [
+      ...new Set([
+        ...projects,
+        ...workspaceRoots,
+        ...state.sessions.filter(onThisDevice).map((session) => session.projectPath),
+      ]),
+    ];
+    void window.desktop
+      .projectIdentities(paths)
+      .then((values) => {
+        if (cancelled) return;
+        const aliases = new Map<string, Set<string>>();
+        for (const value of values) {
+          const old = value.path.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase();
+          const targets = aliases.get(old) ?? new Set<string>();
+          targets.add(value.key);
+          aliases.set(old, targets);
+          aliases.set(lexicalPathKey(value.path), new Set([value.key]));
+        }
+        registerPathIdentities(values);
+        setPrefs((prefs) => {
+          const key = (value: string) =>
+            aliases.get(value)?.size === 1 ? [...aliases.get(value)!][0] : value;
+          return {
+            ...prefs,
+            pinnedProjects: [...new Set(prefs.pinnedProjects.map(key))],
+            collapsedProjects: [...new Set(prefs.collapsedProjects.map(key))],
+            projectNames: Object.fromEntries(
+              Object.entries(prefs.projectNames).map(([name, title]) => [key(name), title]),
+            ),
+          };
+        });
+        setPathRevision((revision) => revision + 1);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projects, workspaceRoots, state.sessions, device]);
   // Each session's native state is read once when it is first shown idle.
   useEffect(() => {
     if (
@@ -396,9 +491,9 @@ export function App() {
           fingerprint: form.fingerprint,
           waits: getPrefs().connection,
         });
-        client.connect(connection.url, form.token, await thisDevice(), false);
+        client.connect(connection.url, form.token, await thisDevice(await readDevice()), false);
       } else {
-        client.connect(form.url, form.token, await thisDevice());
+        client.connect(form.url, form.token, await thisDevice(await readDevice()));
       }
       localStorage.setItem('proxy-url', form.url);
     } catch (error) {
@@ -477,7 +572,40 @@ export function App() {
     if (response.sessionId) show(response.sessionId);
   }
   async function createInProject(path: string) {
-    await act(() => createSession(path));
+    await act(() => withProjectAccess(path, createSession));
+  }
+  async function withProjectAccess(path: string, apply: (path: string) => Promise<void>) {
+    if (!nativeMode || !isMac()) {
+      await apply(path);
+      return;
+    }
+    const connectionId = client.state.connectionId;
+    const result = await checkProjectAccess(path);
+    if (client.state.connectionId !== connectionId || client.state.status !== 'connected') return;
+    if (!result.ok) {
+      setAccess({ kind: 'setup', path, result, apply });
+      return;
+    }
+    registerPathIdentities([result.identity]);
+    await apply(result.path);
+    setAccess(null);
+  }
+  async function inspectProject(
+    path: string,
+    issue?: ToolAccessIssue,
+    sessionId?: string,
+    returnFocus?: HTMLElement,
+  ) {
+    const connectionId = client.state.connectionId;
+    const result = await checkProjectAccess(path, issue);
+    if (
+      client.state.connectionId !== connectionId ||
+      client.state.status !== 'connected' ||
+      (sessionId && client.state.selectedId !== sessionId)
+    )
+      return;
+    if (result.ok) registerPathIdentities([result.identity]);
+    setAccess({ kind: 'diagnostic', path, result, issue, sessionId, returnFocus });
   }
   async function addProject() {
     if (!window.desktop?.chooseProject) {
@@ -486,7 +614,10 @@ export function App() {
     }
     await act(async () => {
       const path = await window.desktop!.chooseProject();
-      if (path) setProjects((value) => withProject(value, path));
+      if (path)
+        await withProjectAccess(path, async (chosen) =>
+          setProjects((value) => withProject(value, chosen)),
+        );
     });
   }
   // The desktop gives a session without a project its own directory; a browser has none to offer and reuses a project.
@@ -495,7 +626,7 @@ export function App() {
       await act(async () => {
         const directory = await window.desktop!.createWorkspace();
         try {
-          await createSession(directory);
+          await withProjectAccess(directory, createSession);
         } catch (error) {
           await window.desktop!.removeWorkspace(directory);
           throw error;
@@ -504,7 +635,9 @@ export function App() {
       return;
     }
     const path =
-      (away ? undefined : selected?.projectPath) ?? projects[0] ?? sessions[0]?.projectPath;
+      (selectedElsewhere ? undefined : selected?.projectPath) ??
+      projects[0] ??
+      sessions[0]?.projectPath;
     if (path) await createInProject(path);
     else await addProject();
   }
@@ -516,13 +649,11 @@ export function App() {
   useEffect(() => window.desktop?.onNotifyClicked((sessionId) => sessionId && show(sessionId)));
   const schedules = useSchedules(
     async (task, due) => {
-      const { status, sessions, selectedId, connectionId } = client.state;
+      const { status, sessions, selectedId } = client.state;
       if (
+        busy ||
         status !== 'connected' ||
-        sessions.some(
-          ({ activeRun }) =>
-            activeRun?.surface === 'terminal' && activeRun.connectionId === connectionId,
-        )
+        sessions.some((item) => item.activeRun?.surface === 'terminal')
       )
         return false;
       let session: Session | undefined;
@@ -530,12 +661,20 @@ export function App() {
         const { sessionId } = task.target;
         session = sessions.find((item) => item.id === sessionId);
         if (!session) throw new Error('目标会话已不存在');
+        if (!onThisDevice(session))
+          throw new Error('目标会话属于另一台设备，请重新绑定本机项目后再运行定时任务。');
         if (session.activeRun) return false;
       } else {
+        let projectPath = task.target.projectPath;
+        if (nativeMode && isMac()) {
+          const result = await checkProjectAccess(projectPath);
+          if (!result.ok) throw new Error(result.message);
+          projectPath = result.path;
+        }
         const created = await client.request({
           type: 'session.create',
           title: task.name,
-          projectPath: task.target.projectPath,
+          projectPath,
         });
         session = client.state.sessions.find((item) => item.id === created.sessionId);
         if (!session) throw new Error('新会话创建失败');
@@ -573,7 +712,7 @@ export function App() {
     const path = window.desktop
       ? await window.desktop.chooseProject()
       : window.prompt('这台电脑上的项目目录', session.projectPath);
-    return path?.trim() || null;
+    return path && path.trim() ? path : null;
   }
   // Takes a session over from the computer it was on: from the next message Claude works in the directory
   // chosen here, on this computer.
@@ -581,8 +720,10 @@ export function App() {
     await act(async () => {
       const projectPath = await placeHere(session);
       if (!projectPath) return;
-      await client.request({ type: 'session.move', sessionId: session.id, projectPath });
-      setProjects((value) => withProject(value, projectPath));
+      await withProjectAccess(projectPath, async (chosen) => {
+        await client.request({ type: 'session.move', sessionId: session.id, projectPath: chosen });
+        setProjects((value) => withProject(value, chosen));
+      });
     });
   }
   // A fork continues from the same context in a session of its own. Forking before a message brings that
@@ -590,17 +731,21 @@ export function App() {
   async function fork(session: Session, before?: { id: string; text: string }) {
     await act(async () => {
       // The copy of a session that is on another computer needs a directory on this one.
-      const projectPath = isHere(session, state.device) ? undefined : await placeHere(session);
+      const projectPath = onThisDevice(session) ? undefined : await placeHere(session);
       if (projectPath === null) return;
-      const response = await client.request({
-        type: 'session.fork',
-        sessionId: session.id,
-        ...(before ? { beforeMessageId: before.id } : {}),
-        ...(projectPath ? { projectPath } : {}),
-      });
-      if (!response.sessionId) return;
-      if (before) setDraft(response.sessionId, before.text);
-      show(response.sessionId);
+      const apply = async (chosen?: string) => {
+        const response = await client.request({
+          type: 'session.fork',
+          sessionId: session.id,
+          ...(before ? { beforeMessageId: before.id } : {}),
+          ...(chosen ? { projectPath: chosen } : {}),
+        });
+        if (!response.sessionId) return;
+        if (before) setDraft(response.sessionId, before.text);
+        show(response.sessionId);
+      };
+      if (projectPath) await withProjectAccess(projectPath, apply);
+      else await apply();
     });
   }
   async function send() {
@@ -695,8 +840,7 @@ export function App() {
             {
               label: '原生终端',
               icon: <SquareTerminal />,
-              // A terminal takes only its own session; others may be running.
-              disabled: !idle || !!session.activeRun,
+              disabled: !idle || !!session.activeRun || !onThisDevice(session),
               run: () => {
                 show(session.id);
                 setTerminalSessionId(session.id);
@@ -744,6 +888,20 @@ export function App() {
         run: () =>
           setPrefs((value) => ({ ...value, pinnedProjects: toggled(value.pinnedProjects, key) })),
       },
+      ...(isMac()
+        ? [
+            {
+              label: '检测项目访问',
+              icon: <RefreshCw />,
+              disabled: !connected || busy,
+              run: () => {
+                void act(async () => {
+                  await inspectProject(path);
+                });
+              },
+            },
+          ]
+        : []),
       { label: '修改显示名称', icon: <Pencil />, run: () => setRenameProject(path) },
       {
         label: '更改文件夹…',
@@ -753,14 +911,14 @@ export function App() {
           if (!window.desktop) return setRepointProject(path);
           void act(async () => {
             const chosen = await window.desktop!.chooseProject();
-            if (chosen) await repoint(path, chosen);
+            if (chosen) await withProjectAccess(chosen, (target) => repoint(path, target));
           });
         },
       },
       ...(window.desktop
         ? [
             {
-              label: '在资源管理器中打开',
+              label: isMac() ? '在 Finder 中打开' : '在资源管理器中打开',
               icon: <FolderOpen />,
               separated: true,
               run: () => {
@@ -775,27 +933,49 @@ export function App() {
   // Every project the session could belong to, the one it is in marked.
   function moveMenu(session: Session): MenuItem[] {
     const paths = [...projects];
-    for (const item of sessions)
+    for (const item of state.sessions.filter(onThisDevice))
       if (
         !isInside(item.projectPath, workspaceRoots) &&
         !paths.some((path) => pathKey(path) === pathKey(item.projectPath))
       )
         paths.push(item.projectPath);
-    return paths.map((path) => ({
-      label: projectLabel(path),
-      detail: path,
-      checked: pathKey(path) === pathKey(session.projectPath),
-      run: () => {
-        if (pathKey(path) !== pathKey(session.projectPath))
-          void act(async () => {
-            await client.request({
-              type: 'session.move',
-              sessionId: session.id,
-              projectPath: path,
+    return [
+      ...paths.map((path) => ({
+        label: projectLabel(path),
+        detail: path,
+        checked: onThisDevice(session) && pathKey(path) === pathKey(session.projectPath),
+        run: () => {
+          if (!onThisDevice(session) || pathKey(path) !== pathKey(session.projectPath))
+            void act(async () => {
+              await withProjectAccess(path, async (projectPath) => {
+                await client.request({ type: 'session.move', sessionId: session.id, projectPath });
+              });
             });
-          });
-      },
-    }));
+        },
+      })),
+      ...(window.desktop
+        ? [
+            {
+              label: '选择本机文件夹…',
+              separated: true,
+              run: () => {
+                void act(async () => {
+                  const chosen = await window.desktop!.chooseProject();
+                  if (chosen)
+                    await withProjectAccess(chosen, async (projectPath) => {
+                      await client.request({
+                        type: 'session.move',
+                        sessionId: session.id,
+                        projectPath,
+                      });
+                      setProjects((values) => withProject(values, projectPath));
+                    });
+                });
+              },
+            },
+          ]
+        : []),
+    ];
   }
   // Points a project at another folder: its sessions move there, and what this computer keeps about the
   // project (its place in the list, its name, its pin) follows.
@@ -803,7 +983,9 @@ export function App() {
     const key = pathKey(from);
     const next = pathKey(to);
     if (key === next) return;
-    const members = sessions.filter((item) => pathKey(item.projectPath) === key);
+    const members = state.sessions.filter(
+      (item) => onThisDevice(item) && pathKey(item.projectPath) === key,
+    );
     if (members.some((item) => item.activeRun))
       throw new Error('这个项目里有会话正在运行，结束后再更改文件夹。');
     for (const item of members)
@@ -962,42 +1144,46 @@ export function App() {
   ];
   // The shortcuts, as the user set them. A key press that something else already took, or that belongs to the
   // native terminal or an open dialog, is left alone.
-  const keys = useRef<(event: KeyboardEvent) => void>(() => {});
-  keys.current = (event) => {
-    if (event.defaultPrevented || !prefs.shortcuts.enabled) return;
-    if (!connected && state.status !== 'reconnecting') return;
-    if (
-      (event.target as Element | null)?.closest?.('.native-terminal') ||
-      document.querySelector('dialog[open]')
-    )
-      return;
-    const combo = comboOf(event);
-    const action = combo && actions.find((item) => keyFor(prefs, item.id) === combo)?.id;
-    if (!action) return;
-    const run: Record<Action, (() => void) | false | undefined> = {
-      back: !terminalSessionId && (() => step(-1)),
-      forward: !terminalSessionId && (() => step(1)),
+  const actionHandler = useRef<(action: Action | 'addProject') => boolean>(() => false);
+  actionHandler.current = (action) => {
+    if (document.querySelector('dialog[open]') || terminalSessionId) return false;
+    const run: Record<Action | 'addProject', (() => void) | false | undefined> = {
+      back: () => step(-1),
+      forward: () => step(1),
       toggleSide,
       newSession: canCreate && (() => void newSession()),
-      settings: () => open('settings'),
-      find:
-        !!selected &&
-        place.page === 'chat' &&
-        !terminalSessionId &&
-        (() => setFindRequest((value) => value + 1)),
+      addProject: canCreate && (() => void addProject()),
+      settings: () => (connected ? open('settings') : setLocalSettings('general')),
+      find: !!selected && place.page === 'chat' && (() => setFindRequest((value) => value + 1)),
       zoomIn: window.desktop && (() => window.desktop!.zoom(1)),
       zoomOut: window.desktop && (() => window.desktop!.zoom(-1)),
       zoomReset: window.desktop && (() => window.desktop!.zoom(0)),
     };
-    const act = run[action];
-    if (!act) return;
-    event.preventDefault();
-    act();
+    const actionRun = run[action];
+    if (!actionRun) return false;
+    actionRun();
+    return true;
+  };
+  const keys = useRef<(event: KeyboardEvent) => void>(() => {});
+  keys.current = (event) => {
+    if (
+      event.defaultPrevented ||
+      !prefs.shortcuts.enabled ||
+      (event.target instanceof Element && event.target.closest('.native-terminal'))
+    )
+      return;
+    const combo = comboOf(event);
+    const action = combo && actions.find((item) => keyFor(prefs, item.id) === combo)?.id;
+    if (action && actionHandler.current(action)) event.preventDefault();
   };
   useEffect(() => {
     const listener = (event: KeyboardEvent) => keys.current(event);
     window.addEventListener('keydown', listener);
-    return () => window.removeEventListener('keydown', listener);
+    const off = window.desktop?.onMenuAction((action) => actionHandler.current(action));
+    return () => {
+      window.removeEventListener('keydown', listener);
+      off?.();
+    };
   }, []);
 
   if (state.status === 'disconnected' || state.status === 'connecting')
@@ -1110,6 +1296,8 @@ export function App() {
         update={pendingUpdate}
         openUpdate={(position) => setMenu({ kind: 'update', ...position })}
         openSettings={(position) => setMenu({ kind: 'settings', ...position })}
+        notifications={notifications}
+        openSession={show}
       />
       {sideOpen && (
         <button
@@ -1124,6 +1312,13 @@ export function App() {
           section={place.section}
           go={(section) => open('settings', section)}
           native={nativeMode}
+          refreshEnvironment={
+            connected && nativeMode && !busy && !state.sessions.some((item) => item.activeRun)
+              ? () => {
+                  void act(() => login(form));
+                }
+              : undefined
+          }
           form={form}
           changeForm={changeForm}
           workspaceRoot={workspaceRoots[0] ?? ''}
@@ -1154,7 +1349,7 @@ export function App() {
       ) : place.page === 'schedules' ? (
         <SchedulePanel
           schedules={schedules}
-          sessions={sessions}
+          sessions={state.sessions.filter(onThisDevice)}
           projects={projects}
           capabilities={capabilities}
         />
@@ -1165,12 +1360,15 @@ export function App() {
             elsewhere={elsewhere}
             selectedId={selected?.id}
             projects={projects}
+            device={nativeMode ? localDevice : null}
+            devicePending={nativeMode && !localDevice}
+            pathRevision={pathRevision}
             workspaceRoots={workspaceRoots}
             connected={connected}
             busy={busy}
             refreshing={refreshing}
             terminalOpen={!!terminalSessionId}
-            notifications={notifications}
+            terminalActive={!!terminalSessionId}
             select={show}
             newSession={() => {
               void newSession();
@@ -1231,12 +1429,21 @@ export function App() {
               native={nativeMode}
               ownsRun={ownsRun}
               busy={busy}
+              inspectAccess={
+                nativeMode && isMac() && selected && onThisDevice(selected)
+                  ? (issue, returnFocus) => {
+                      void act(() =>
+                        inspectProject(selected.projectPath, issue, selected.id, returnFocus),
+                      );
+                    }
+                  : undefined
+              }
               newSession={() => {
                 void newSession();
               }}
               loadEarlier={() => client.loadEarlier(selected!.id)}
               edit={
-                controlsDisabled || away
+                controlsDisabled || selectedElsewhere
                   ? undefined
                   : (id, text) => {
                       void fork(selected!, { id, text });
@@ -1266,79 +1473,80 @@ export function App() {
                 });
               }}
             />
-            {selected && away && (
-              <div className="elsewhere-bar" role="status">
-                <Laptop />
-                <p>
-                  这个会话在设备“{selected.device!.name}”上，项目目录是{' '}
-                  <code>{selected.projectPath}</code>
-                  。要在这台电脑上接着做，先选它在这里的项目目录；下一条消息会告诉 Claude 换了电脑。
-                </p>
-                <button
-                  type="button"
-                  className="button primary"
-                  disabled={controlsDisabled}
-                  onClick={() => {
-                    void takeOver(selected);
-                  }}
-                >
-                  在本机继续…
-                </button>
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={controlsDisabled}
-                  onClick={() => {
-                    void fork(selected);
-                  }}
-                >
-                  分叉到本机…
-                </button>
-              </div>
-            )}
-            {selected && !away && !terminalSessionId && (
-              <Composer
-                session={selected}
-                projectName={
-                  isInside(selected.projectPath, workspaceRoots)
-                    ? null
-                    : projectLabel(selected.projectPath)
-                }
-                chooseProject={
-                  controlsDisabled
-                    ? undefined
-                    : (position) => setMenu({ kind: 'move', sessionId: selected.id, ...position })
-                }
-                draft={draft}
-                setDraft={(text) => setDraft(selected.id, text)}
-                native={nativeMode}
-                connected={connected}
-                busy={busy}
-                refreshing={refreshing}
-                canRefreshModels={!state.sessions.some((session) => session.activeRun)}
-                ownsRun={ownsRun}
-                inputDisabled={inputDisabled}
-                controlsDisabled={controlsDisabled}
-                slashOpen={slashOpen}
-                setSlashOpen={setSlashOpen}
-                canCompact={canCompact}
-                scenario={scenario}
-                setScenario={setScenario}
-                capabilities={capabilities}
-                nativeSession={nativeSession}
-                metrics={metrics}
-                send={() => {
-                  void send();
-                }}
-                compact={() => {
-                  void compact();
-                }}
-                refresh={() => {
-                  void refreshStatus();
-                }}
-                configure={configure}
-                stop={stopRun}
-              />
+            {selected && !terminalSessionId && (
+              <>
+                {selectedElsewhere && (
+                  <div className="elsewhere-bar" role="status">
+                    <p>
+                      此会话属于另一台执行设备“{selected.device?.name ?? '历史 Windows'}
+                      ”。项目目录为 <code>{selected.projectPath}</code>
+                      。请选择本机项目文件夹，将会话重新绑定后继续。
+                    </p>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      disabled={busy || !connected || !!selected.activeRun}
+                      onClick={() => void takeOver(selected)}
+                    >
+                      在本机继续…
+                    </button>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      disabled={busy || !connected || !!selected.activeRun}
+                      onClick={() => void fork(selected)}
+                    >
+                      分叉到本机…
+                    </button>
+                  </div>
+                )}
+                {!selectedElsewhere && (
+                  <Composer
+                    session={selected}
+                    localProject={!selectedElsewhere}
+                    projectName={
+                      isInside(selected.projectPath, workspaceRoots)
+                        ? null
+                        : projectLabel(selected.projectPath)
+                    }
+                    chooseProject={
+                      controlsDisabled
+                        ? undefined
+                        : (position) =>
+                            setMenu({ kind: 'move', sessionId: selected.id, ...position })
+                    }
+                    draft={draft}
+                    setDraft={(text) => setDraft(selected.id, text)}
+                    native={nativeMode}
+                    connected={connected}
+                    busy={busy}
+                    refreshing={refreshing}
+                    canRefreshModels={!state.sessions.some((session) => session.activeRun)}
+                    ownsRun={ownsRun}
+                    inputDisabled={inputDisabled}
+                    controlsDisabled={controlsDisabled}
+                    slashOpen={slashOpen}
+                    setSlashOpen={setSlashOpen}
+                    canCompact={canCompact}
+                    scenario={scenario}
+                    setScenario={setScenario}
+                    capabilities={capabilities}
+                    nativeSession={nativeSession}
+                    metrics={metrics}
+                    send={() => {
+                      void send();
+                    }}
+                    compact={() => {
+                      void compact();
+                    }}
+                    refresh={() => {
+                      void refreshStatus();
+                    }}
+                    configure={configure}
+                    stop={stopRun}
+                  />
+                )}
+              </>
             )}
           </main>
         </>
@@ -1354,6 +1562,22 @@ export function App() {
           above={menu.above}
           onClose={closeMenu}
           items={openMenu.items}
+        />
+      )}
+      {access && (
+        <ProjectAccessDialog
+          path={access.path}
+          result={access.result}
+          issue={access.kind === 'diagnostic' ? access.issue : undefined}
+          returnFocus={access.kind === 'diagnostic' ? access.returnFocus : undefined}
+          close={() => setAccess(null)}
+          retry={() =>
+            act(() =>
+              access.kind === 'setup'
+                ? withProjectAccess(access.path, access.apply)
+                : inspectProject(access.path, access.issue, access.sessionId, access.returnFocus),
+            )
+          }
         />
       )}
       {repointProject && (
@@ -1401,7 +1625,10 @@ export function App() {
               await client.request({ type: 'session.delete', sessionId: deleteSession.id });
               setDraft(deleteSession.id, '');
               // A plain session's directory goes with it when the session left nothing there.
-              if (isInside(deleteSession.projectPath, workspaceRoots))
+              if (
+                onThisDevice(deleteSession) &&
+                isInside(deleteSession.projectPath, workspaceRoots)
+              )
                 void window.desktop?.removeWorkspace(deleteSession.projectPath);
               setDeleteSession(null);
             });

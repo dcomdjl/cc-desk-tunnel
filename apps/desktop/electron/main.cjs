@@ -6,6 +6,8 @@ const {
   Tray,
   nativeImage,
   powerSaveBlocker,
+  powerMonitor,
+  autoUpdater,
   safeStorage,
   session,
   ipcMain,
@@ -26,18 +28,24 @@ const {
   writeFileSync,
   writeSync,
 } = require('node:fs');
-const { mkdtemp, stat, writeFile } = require('node:fs/promises');
+const { stat, writeFile } = require('node:fs/promises');
 const { gitBranch } = require('./git-branch.cjs');
 const { openLog } = require('./client-log.cjs');
 const { hostname, tmpdir } = require('node:os');
-const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { mkdir, readdir, rmdir, unlink } = require('node:fs/promises');
+const { readdir, rmdir, unlink } = require('node:fs/promises');
+const { projectIdentity, projectIdentities, removeEmptyWorkspace } = require('./project-paths.cjs');
+const { randomUUID } = require('node:crypto');
+const { mkdir } = require('node:fs/promises');
 const { pathToFileURL } = require('node:url');
 let bridge;
 // The last connection, kept for its installer download after a service refused this client's version.
 let lastBridge;
 let connectionGeneration = 0;
+let connecting;
+let updateAttempt;
+const cancelUpdate = () =>
+  updateAttempt?.abort(new Error('连接已改变或客户端正在退出，更新已停止。'));
 const ownsInstance = app.requestSingleInstanceLock();
 if (!ownsInstance) app.quit();
 function showWindow() {
@@ -48,6 +56,7 @@ function showWindow() {
   window.focus();
 }
 app.on('second-instance', showWindow);
+app.on('activate', showWindow);
 
 // Window preferences and the optional saved sign-in live in the user's profile, outside the install directory.
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
@@ -63,6 +72,53 @@ function writeSettings(values) {
   writeFileSync(settingsPath(), JSON.stringify(settings, null, 2));
   return settings;
 }
+function deviceId() {
+  const saved = readSettings().deviceId;
+  if (typeof saved === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(saved))
+    return saved;
+  const created = randomUUID();
+  writeSettings({ deviceId: created });
+  return created;
+}
+handle('device:info', () => ({
+  deviceId: deviceId(),
+  platform: process.platform,
+  arch: process.arch,
+  name: hostname(),
+}));
+handle('project:identities', (_event, directories) => projectIdentities(directories));
+handle('project:check', async (_event, directory, options) => {
+  const { accessFailure, accessStatus } = await import(
+    pathToFileURL(path.join(__dirname, 'project-access.mjs')).href
+  );
+  if (!bridge) return accessStatus('offline', 'connect', directory);
+  const current = bridge;
+  let stage = 'connect';
+  let source = 'ssh';
+  let result;
+  try {
+    result = await current.checkProject(directory, {
+      targetPath: options?.targetPath,
+      targetOperation: options?.targetOperation,
+    });
+    if (result.ok) {
+      stage = 'path';
+      source = 'filesystem';
+      result = { ...result, identity: await projectIdentity(result.path) };
+    }
+  } catch (error) {
+    result = accessFailure(error, stage, { source, path: directory });
+  }
+  if (current !== bridge) return accessStatus('cancelled', 'connect', directory);
+  return result;
+});
+handle('privacy:open', async () => {
+  if (process.platform !== 'darwin') throw new Error('当前系统不支持 macOS 隐私设置。');
+  // A dedicated fixed destination avoids exposing arbitrary system URL schemes.
+  await shell.openExternal(
+    'x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders',
+  );
+});
 
 // See client-log.cjs. Opened on first use, once the profile directory is known.
 let record;
@@ -180,8 +236,10 @@ function workspaceRoots() {
   const roots = [...(Array.isArray(saved) ? saved : []), defaultRoot()].filter(
     (root) => typeof root === 'string' && root,
   );
+  const key = (root) =>
+    process.platform === 'win32' ? path.resolve(root).toLowerCase() : path.resolve(root);
   return roots.filter(
-    (root, index) => roots.findIndex((item) => item.toLowerCase() === root.toLowerCase()) === index,
+    (root, index) => roots.findIndex((item) => key(item) === key(root)) === index,
   );
 }
 handle('workspace:roots', () => workspaceRoots());
@@ -218,22 +276,15 @@ handle('workspace:create', async (event) => {
   }
 });
 handle('workspace:remove', async (event, directory) => {
-  const target = path.resolve(String(directory));
-  if (
-    !workspaceRoots().some((root) =>
-      /^\d{4}-\d{2}-\d{2}[\\/][^\\/]+$/.test(path.relative(root, target)),
-    )
-  )
-    return;
-  // rmdir only removes empty directories, so anything the session produced stays.
-  try {
-    await rmdir(target);
-    await rmdir(path.dirname(target));
-  } catch {}
+  await removeEmptyWorkspace(directory, workspaceRoots());
 });
 handle('proxy:connect', async (event, config) => {
   if (!config || typeof config.url !== 'string' || typeof config.fingerprint !== 'string')
     throw new Error('Invalid proxy configuration');
+  cancelUpdate();
+  connecting?.abort(new Error('Connection cancelled'));
+  const controller = new AbortController();
+  connecting = controller;
   const generation = ++connectionGeneration;
   const previous = bridge;
   bridge = null;
@@ -254,6 +305,9 @@ handle('proxy:connect', async (event, config) => {
     {
       openssh,
       powershell,
+      deviceId: deviceId(),
+      schedulesPath: schedulesPath(),
+      signal: controller.signal,
       scriptDirectory: app.isPackaged
         ? path.join(process.resourcesPath, 'app.asar.unpacked/electron')
         : undefined,
@@ -274,19 +328,25 @@ handle('proxy:connect', async (event, config) => {
     await connection.close();
     throw new Error('Connection cancelled');
   }
+  if (connecting === controller) connecting = undefined;
   bridge = lastBridge = connection;
   keepAwake(true);
   return { url: bridge.url };
 });
-// The service token is kept only when the user asks, encrypted for the current Windows account.
+// The service token is saved only through the OS credential store.
 handle('login:load', () => {
   const { login } = readSettings();
   if (!login) return null;
   let token = '';
+  let notice;
   try {
-    if (login.token && safeStorage.isEncryptionAvailable())
+    if (login.token) {
+      if (!safeStorage.isEncryptionAvailable()) throw new Error('Credential store unavailable');
       token = safeStorage.decryptString(Buffer.from(login.token, 'base64'));
-  } catch {}
+    }
+  } catch {
+    notice = '无法读取已保存的服务凭据。请检查系统凭据存储或钥匙串权限，或重新输入凭据。';
+  }
   return {
     url: String(login.url ?? ''),
     fingerprint: String(login.fingerprint ?? ''),
@@ -294,10 +354,13 @@ handle('login:load', () => {
     token,
     remember: !!token,
     autoLogin: !!token && login.autoLogin === true,
+    notice,
   };
 });
 handle('login:save', (_event, login) => {
-  const remember = login?.remember === true && safeStorage.isEncryptionAvailable();
+  const remember = login?.remember === true;
+  if (remember && !safeStorage.isEncryptionAvailable())
+    throw new Error('系统凭据存储不可用，无法保存服务凭据。请检查钥匙串访问权限后重试。');
   writeSettings({
     login: remember
       ? {
@@ -369,7 +432,7 @@ handle('schedules:save', (_event, text) => {
 handle('app:version', () => app.getVersion());
 // Which of the user's computers this is to the service: an ID made once and kept, under the computer's name.
 handle('device:get', () => ({
-  id: readSettings().deviceId ?? writeSettings({ deviceId: randomUUID() }).deviceId,
+  id: deviceId(),
   name: hostname(),
 }));
 handle('app:quit', () => app.quit());
@@ -408,35 +471,105 @@ handle('notify:show', (event, notice) => {
     window.once('focus', () => window.flashFrame(false));
   }
 });
-// Upgrades in place: the installer runs silently over the current install and starts the new version. It
-// comes from the connected service, or, when the user chooses so, straight from the release page: `version`
-// is then the one to fetch, which the service's refusal of this client named.
+// Upgrades in place: the installer comes from the connected service, runs silently over the current install
+// and starts the new version.
 handle('update:install', async (event, version) => {
-  if (!app.isPackaged) throw new Error('源码运行不支持自升级；请重新打包安装。');
-  const directory = await mkdtemp(path.join(tmpdir(), 'cc-desk-tunnel-update-'));
-  let installer;
-  if (version === undefined) {
-    if (!lastBridge) throw new Error('请先连接服务。');
-    installer = await lastBridge.downloadInstaller(directory);
-  } else {
-    const { downloadRelease } = await import(
-      pathToFileURL(path.join(__dirname, 'release-download.mjs')).href
-    );
-    let told = 0;
-    // Chromium's network stack: the Windows proxy settings apply, as they do to the connection itself.
-    installer = await downloadRelease((url, init) => net.fetch(url, init), version, directory, {
-      announced: lastBridge?.release(),
-      progress(received, size) {
-        if (Date.now() - told < 500 && received < size) return;
-        told = Date.now();
-        if (!event.sender.isDestroyed()) event.sender.send('update:progress', { received, size });
+  if (updateAttempt) throw new Error('客户端更新正在进行。');
+  if (!lastBridge) throw new Error('请先连接服务。');
+  const connection = lastBridge;
+  if (version !== undefined && !/^\d+\.\d+\.\d+$/.test(String(version)))
+    throw new Error('版本号不正确。');
+  const generation = connectionGeneration;
+  const controller = new AbortController();
+  updateAttempt = controller;
+  const assertCurrent = () => {
+    if (lastBridge !== connection || connectionGeneration !== generation || quitting)
+      throw new Error('连接已改变或客户端正在退出，更新已停止。');
+  };
+  const { installClientUpdate } = require('./client-update.cjs');
+  let prepared = false;
+  try {
+    const downloadConnection =
+      version === undefined
+        ? connection
+        : {
+            hasActiveRuns: () => connection.hasActiveRuns(),
+            downloadInstaller: async (directory, { signal }) => {
+              const { downloadRelease } = await import(
+                pathToFileURL(path.join(__dirname, 'release-download.mjs')).href
+              );
+              let release;
+              let told = 0;
+              const announced =
+                connection.release?.platform === process.platform ||
+                (!connection.release?.platform && process.platform === 'win32')
+                  ? connection.release
+                  : undefined;
+              const target = await downloadRelease(
+                (url, init) => net.fetch(url, init),
+                version,
+                directory,
+                {
+                  platform: process.platform,
+                  arch: process.arch,
+                  announced,
+                  signal,
+                  metadata: (value) => {
+                    release = value;
+                  },
+                  progress: (received, size) => {
+                    if (Date.now() - told < 500 && received < size) return;
+                    told = Date.now();
+                    if (!event.sender.isDestroyed())
+                      event.sender.send('update:progress', { received, size });
+                  },
+                },
+              );
+              return { path: target, release };
+            },
+          };
+    await installClientUpdate({
+      app,
+      autoUpdater,
+      shell,
+      connection: downloadConnection,
+      platform: process.platform,
+      unsigned: app.isPackaged && require('../package.json').macUnsigned,
+      signal: controller.signal,
+      assertCurrent,
+      beforeInstall: async () => {
+        assertCurrent();
+        const previous = bridge;
+        await previous?.close();
+        assertCurrent();
+        if (bridge === previous) bridge = null;
+        keepAwake(false);
+        prepared = true;
+        quitting = true;
       },
     });
+  } catch (error) {
+    if (prepared && !exiting) {
+      nativeInstalling = false;
+      quitting = false;
+      if (!event.sender.isDestroyed()) event.sender.send('proxy:closed');
+      if (BrowserWindow.getAllWindows().length) showWindow();
+      else {
+        dialog.showErrorBox(
+          '客户端更新没有完成',
+          `${error.message}\n请重新启动客户端后检查版本，必要时使用正式安装包重新安装。`,
+        );
+        app.quit();
+      }
+    }
+    throw error;
+  } finally {
+    if (updateAttempt === controller) updateAttempt = undefined;
   }
-  spawn(installer, ['/S', '--force-run'], { detached: true, stdio: 'ignore' }).unref();
-  app.quit();
 });
-ipcMain.handle('proxy:disconnect', async () => {
+handle('proxy:disconnect', async () => {
+  cancelUpdate();
+  connecting?.abort(new Error('Connection cancelled'));
   keepAwake(false);
   connectionGeneration++;
   const previous = bridge;
@@ -453,12 +586,70 @@ app.whenReady().then(() => {
   if (!ownsInstance) return;
   // Shortcuts are the page's, where the user can change them or turn them off; Electron's default menu would
   // add its own on top (zoom, reload, close). A run from source keeps reload and the developer tools.
+  const action = (name) => () =>
+    BrowserWindow.getAllWindows()[0]?.webContents.send('menu:action', name);
   Menu.setApplicationMenu(
-    app.isPackaged
-      ? null
-      : Menu.buildFromTemplate([
-          { label: '开发', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }] },
-        ]),
+    process.platform === 'darwin'
+      ? Menu.buildFromTemplate([
+          {
+            label: 'CC Desk Tunnel',
+            submenu: [
+              { role: 'about' },
+              { label: '设置…', click: action('settings') },
+              { type: 'separator' },
+              { role: 'services' },
+              { type: 'separator' },
+              { role: 'hide' },
+              { role: 'hideOthers' },
+              { role: 'unhide' },
+              { type: 'separator' },
+              { role: 'quit' },
+            ],
+          },
+          {
+            label: '文件',
+            submenu: [
+              { label: '新建会话', click: action('newSession') },
+              { label: '添加项目…', click: action('addProject') },
+              { type: 'separator' },
+              { role: 'close' },
+            ],
+          },
+          {
+            label: '编辑',
+            submenu: [
+              { role: 'undo' },
+              { role: 'redo' },
+              { type: 'separator' },
+              { role: 'cut' },
+              { role: 'copy' },
+              { role: 'paste' },
+              { role: 'selectAll' },
+              { type: 'separator' },
+              { label: '查找对话内容', click: action('find') },
+            ],
+          },
+          {
+            label: '视图',
+            submenu: [
+              { label: '收起或展开侧栏', click: action('toggleSide') },
+              { label: '放大界面', click: action('zoomIn') },
+              { label: '缩小界面', click: action('zoomOut') },
+              { label: '恢复界面大小', click: action('zoomReset') },
+              { type: 'separator' },
+              { role: 'togglefullscreen' },
+            ],
+          },
+          { role: 'windowMenu', label: '窗口' },
+          ...(!app.isPackaged
+            ? [{ label: '开发', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }] }]
+            : []),
+        ])
+      : app.isPackaged
+        ? null
+        : Menu.buildFromTemplate([
+            { label: '开发', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }] },
+          ]),
   );
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) =>
     callback(false),
@@ -470,7 +661,7 @@ app.whenReady().then(() => {
     minHeight: 560,
     backgroundColor: '#edf0f6',
     title: 'CC Desk Tunnel',
-    // The page draws the title bar; the system adds only its window buttons, over the bar's right end.
+    // Match the page's --bar height so native controls and navigation icons share a vertical center.
     titleBarStyle: 'hidden',
     titleBarOverlay: { color: '#edf0f6', symbolColor: '#22262e', height: 40 },
     icon: path.join(__dirname, 'icon.png'),
@@ -484,7 +675,10 @@ app.whenReady().then(() => {
       backgroundThrottling: false,
       preload: path.join(__dirname, 'preload.cjs'),
       // Only a build run from the source tree offers the login page's simulation mode.
-      additionalArguments: app.isPackaged ? [] : ['--cc-desk-tunnel-dev'],
+      additionalArguments: [
+        `--cc-desk-tunnel-platform=${process.platform}`,
+        ...(app.isPackaged ? [] : ['--cc-desk-tunnel-dev']),
+      ],
     },
   });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -508,7 +702,11 @@ app.whenReady().then(() => {
   // Long tasks keep running with the window closed: closing hides it, and the tray icon brings it back or quits.
   const closeToTray = () => readSettings().closeToTray !== false;
   const tray = new Tray(
-    nativeImage.createFromPath(path.join(__dirname, 'icon.png')).resize({ width: 32, height: 32 }),
+    process.platform === 'darwin'
+      ? require('./tray-icon.cjs').terminalTemplate(nativeImage)
+      : nativeImage
+          .createFromPath(path.join(__dirname, 'icon.png'))
+          .resize({ width: 32, height: 32 }),
   );
   const buildMenu = () =>
     tray.setContextMenu(
@@ -537,20 +735,43 @@ app.whenReady().then(() => {
     window.hide();
     if (!readSettings().trayHintShown) {
       writeSettings({ trayHintShown: true });
-      tray.displayBalloon({
-        title: 'CC Desk Tunnel 仍在后台运行',
-        content: '点击托盘图标恢复窗口；右键图标选择“退出”才会结束连接。',
-      });
+      if (process.platform === 'win32')
+        tray.displayBalloon({
+          title: 'CC Desk Tunnel 仍在后台运行',
+          content: '点击托盘图标恢复窗口；右键图标选择“退出”才会结束连接。',
+        });
     }
+  });
+  powerMonitor.on('resume', () => {
+    cancelUpdate();
+    connecting?.abort(new Error('Connection cancelled'));
+    // A sleeping TCP connection cannot establish whether a command completed. End it without replay.
+    const previous = bridge;
+    bridge = null;
+    keepAwake(false);
+    connectionGeneration++;
+    if (previous)
+      void previous.close().finally(() => {
+        if (!window.webContents.isDestroyed()) window.webContents.send('proxy:closed');
+      });
   });
 });
 let quitting = false;
+let nativeInstalling = false;
+autoUpdater.on('before-quit-for-update', () => {
+  nativeInstalling = true;
+  quitting = true;
+});
 let exiting = false;
 app.on('before-quit', (event) => {
   quitting = true;
+  cancelUpdate();
+  connecting?.abort(new Error('Connection cancelled'));
   if (exiting || !bridge) return;
   event.preventDefault();
   exiting = true;
   bridge.close().finally(() => app.quit());
 });
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  if (!nativeInstalling) app.quit();
+});

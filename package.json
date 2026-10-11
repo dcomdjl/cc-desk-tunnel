@@ -33,14 +33,15 @@
     "prepare:windows:package": "pwsh.exe -NoLogo -NoProfile -File scripts/prepare-windows.ps1 -IncludePowerShell",
     "package:windows": "node scripts/package-windows.mjs",
     "release": "node scripts/release.mjs",
-    "desktop": "npm run start --workspace @cc-desk-tunnel/desktop"
+    "desktop": "npm run start --workspace @cc-desk-tunnel/desktop",
+    "package:macos": "node scripts/package-macos.mjs"
   },
   "devDependencies": {
+    "@electron/notarize": "2.5.0",
     "@playwright/test": "1.63.0",
     "@types/node": "24.10.1",
     "electron-builder": "26.15.3",
     "prettier": "3.9.9",
-    "ssh2": "1.17.0",
     "typescript": "5.9.3"
   },
   "allowScripts": {

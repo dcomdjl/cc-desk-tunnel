@@ -436,9 +436,16 @@ button.chip:hover:not(:disabled) {
 .titlebar button {
   -webkit-app-region: no-drag;
 }
+html[data-platform='darwin'] .titlebar {
+  padding-left: 86px;
+  padding-right: 10px;
+}
+html[data-platform='darwin'] .titlebar-menus {
+  display: none;
+}
 .titlebar .icon-button {
   width: 30px;
-  height: 28px;
+  height: 30px;
 }
 .titlebar .icon-button svg {
   width: 16px;
@@ -508,7 +515,8 @@ button.chip:hover:not(:disabled) {
   padding: 6px 0 12px;
   min-height: 0;
 }
-.rail button {
+.rail > button,
+.rail .notice-bell > button {
   display: grid;
   place-items: center;
   width: 36px;
@@ -519,11 +527,13 @@ button.chip:hover:not(:disabled) {
   background: transparent;
   color: var(--muted);
 }
-.rail button:hover {
+.rail > button:hover,
+.rail .notice-bell > button:hover {
   background: var(--hover);
   color: var(--text);
 }
-.rail button[aria-current='page'] {
+.rail > button[aria-current='page'],
+.rail .notice-bell > button[aria-expanded='true'] {
   background: var(--surface);
   color: var(--text);
   box-shadow: 0 1px 3px #1b25331f;
@@ -830,9 +840,9 @@ button.chip:hover:not(:disabled) {
 .notice-list {
   position: absolute;
   z-index: 20;
-  top: calc(100% + 6px);
-  left: -120px;
-  width: 300px;
+  bottom: 0;
+  left: calc(100% + 8px);
+  width: min(320px, calc(100vw - 64px));
   max-height: min(420px, 70dvh);
   overflow-y: auto;
   padding: 6px;
@@ -2680,6 +2690,12 @@ dialog::backdrop {
   gap: 10px;
   margin-top: 10px;
 }
+.project-access-dialog code {
+  overflow-wrap: anywhere;
+}
+.project-access-dialog .dialog-actions {
+  flex-wrap: wrap;
+}
 .delete-question {
   overflow-wrap: anywhere;
   margin-bottom: 10px;
@@ -2692,7 +2708,8 @@ dialog::backdrop {
   .shell.side-closed {
     grid-template-columns: 44px 0 minmax(0, 1fr);
   }
-  .rail button {
+  .rail > button,
+  .rail .notice-bell > button {
     width: 34px;
     height: 34px;
   }

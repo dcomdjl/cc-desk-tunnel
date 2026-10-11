@@ -140,3 +140,66 @@ test('nothing is kept of a file that is not the announced one, of a download tha
     /版本号不正确/,
   );
 });
+
+test('GitHub downloads select the current Mac architecture and prefer ZIP for signed installation', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'cc-mac-release-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  for (const arch of ['arm64', 'x64']) {
+    const zip = `CC-Desk-Tunnel-9.8.7-darwin-${arch}.zip`;
+    const dmg = `CC-Desk-Tunnel-9.8.7-darwin-${arch}.dmg`;
+    const requested = [];
+    let selected;
+    const fetcher = async (url) => {
+      requested.push(url);
+      if (url.endsWith('/release.json'))
+        return Response.json({
+          version: '9.8.7',
+          files: [
+            { name, size: installer.length, sha256 },
+            { name: dmg, size: installer.length, sha256, platform: 'darwin', arch, format: 'dmg' },
+            { name: zip, size: installer.length, sha256, platform: 'darwin', arch, format: 'zip' },
+          ],
+        });
+      assert.ok(url.endsWith(`/${zip}`));
+      return new Response(installer);
+    };
+    const path = await downloadRelease(fetcher, '9.8.7', directory, {
+      platform: 'darwin',
+      arch,
+      metadata: (value) => {
+        selected = value;
+      },
+    });
+    assert.equal(path, join(directory, zip));
+    assert.deepEqual(readFileSync(path), installer);
+    assert.equal(selected.format, 'zip');
+    assert.equal(selected.arch, arch);
+    assert.equal(requested.length, 2);
+  }
+});
+
+test('cancelling a GitHub download stops the current fetch without retry and removes its file', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'cc-release-cancel-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const controller = new AbortController();
+  let begin;
+  const started = new Promise((resolve) => {
+    begin = resolve;
+  });
+  let downloads = 0;
+  const fetcher = async (url, options) => {
+    if (url.endsWith('/release.json'))
+      return Response.json({ version: '9.8.7', files: [{ name, size: installer.length, sha256 }] });
+    downloads++;
+    begin();
+    return new Promise((_, reject) =>
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }),
+    );
+  };
+  const downloading = downloadRelease(fetcher, '9.8.7', directory, { signal: controller.signal });
+  await started;
+  controller.abort(new Error('用户取消'));
+  await assert.rejects(downloading, /用户取消/);
+  assert.equal(downloads, 1);
+  assert.deepEqual(readdirSync(directory), []);
+});

@@ -5,13 +5,15 @@ import { open, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { ServiceUpdate } from '@cc-desk-tunnel/protocol';
+import { clientAsset } from './client-release.ts';
+import type { ClientAsset } from './client-release.ts';
 
 const run = promisify(execFile);
 const versionPattern = /^\d+\.\d+\.\d+$/;
 type Manifest = {
   version: string;
   runtime: number;
-  files: { name: string; size: number; sha256: string }[];
+  files: ({ name: string; size: number; sha256: string } & Partial<Omit<ClientAsset, 'version'>>)[];
   // Where each file of the release is downloaded from.
   assets: Map<string, string>;
 };
@@ -68,6 +70,8 @@ export class ServiceUpdates {
   private notify: (state: ServiceUpdate) => void;
   private pending: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
+  private first: NodeJS.Timeout | undefined;
+  private startup: Promise<void> | undefined;
   private pace: typeof downloadPace;
   private stopped = false;
   // The installer of this version on its way into the client directory; undefined once it is there or while
@@ -84,13 +88,15 @@ export class ServiceUpdates {
     return this.state.state === 'installing' || this.state.state === 'restarting';
   }
   start() {
-    const first = setTimeout(() => void this.check(), 60_000);
-    first.unref();
+    if (this.timer) return this.startup ?? Promise.resolve();
+    this.first = setTimeout(() => void this.check(), 60_000);
+    this.first.unref();
     this.timer = setInterval(() => void this.check(), 6 * 3600_000);
     this.timer.unref();
     // Clients need the installer of this version. It is fetched beside the running service, never as a step
     // of an upgrade: the service is useful without it, and a client can also get it from the release page.
-    void this.tidy().then(() => this.prepareInstaller());
+    this.startup = this.tidy().then(() => this.prepareInstaller());
+    return this.startup;
   }
   // Removes what earlier upgrades left behind, now that this program has started: the programs of other
   // versions, which nothing starts any more, and downloads that never finished. Nothing else is touched.
@@ -111,12 +117,14 @@ export class ServiceUpdates {
   stop() {
     this.stopped = true;
     clearInterval(this.timer);
+    clearTimeout(this.first);
     clearTimeout(this.retry);
   }
   // Fetches the installer of this version unless it is here or already on its way; tried again later after a
   // failure. Called at start and whenever a client of another version signs in.
   prepareInstaller() {
-    if (this.fetching || this.stopped) return;
+    if (this.fetching) return this.fetching;
+    if (this.stopped) return Promise.resolve();
     clearTimeout(this.retry);
     this.fetching = this.release(`tags/v${this.version}`)
       .then((manifest) => this.installer(manifest))
@@ -129,6 +137,7 @@ export class ServiceUpdates {
         this.preparing = undefined;
         this.fetching = undefined;
       });
+    return this.fetching;
   }
   private set(state: ServiceUpdate) {
     this.state = state;
@@ -175,11 +184,26 @@ export class ServiceUpdates {
     if (
       !versionPattern.test(manifest.version) ||
       !Array.isArray(manifest.files) ||
-      manifest.files.some(
-        (file) => !/^[\w.-]+$/.test(file.name) || !/^[0-9a-f]{64}$/.test(file.sha256),
-      )
+      new Set(manifest.files.map((file) => file.name)).size !== manifest.files.length ||
+      manifest.files.some((file) => {
+        if (
+          !/^[\w.-]+$/.test(file.name) ||
+          !/^[0-9a-f]{64}$/.test(file.sha256) ||
+          !Number.isSafeInteger(file.size) ||
+          file.size <= 0
+        )
+          return true;
+        const asset = clientAsset(file.name);
+        return ['platform', 'arch', 'format'].some(
+          (key) =>
+            file[key as keyof typeof file] !== undefined &&
+            file[key as keyof typeof file] !== asset?.[key as keyof ClientAsset],
+        );
+      })
     )
       throw new Error('release.json 格式不符。');
+    if (which.startsWith('tags/v') && manifest.version !== which.slice('tags/v'.length))
+      throw new Error('release.json 版本与发布标签不符。');
     return { ...manifest, runtime: Number(manifest.runtime) || 1, assets };
   }
   // Downloads one file of the release, in stretches (see `downloadPace`), and keeps it only if its hash is the
@@ -253,15 +277,41 @@ export class ServiceUpdates {
     await rename(partial, target);
   }
   private async installer(manifest: Manifest) {
-    const name = `CC-Desk-Tunnel-Setup-${manifest.version}-x64.exe`;
-    const target = join(this.options.clientDir, name);
-    if (existsSync(target)) return;
+    const clients = manifest.files.filter(
+      (file) => clientAsset(file.name)?.version === manifest.version,
+    );
+    if (!clients.length) throw new Error('发布中缺少客户端安装包。');
     mkdirSync(this.options.clientDir, { recursive: true });
-    const size = manifest.files.find((item) => item.name === name)?.size ?? 0;
-    this.preparing = { version: manifest.version, received: 0, size };
-    await this.download(manifest, name, target, (received) => {
-      this.preparing = { version: manifest.version, received, size };
-    });
+    for (const file of clients) {
+      const target = join(this.options.clientDir, file.name);
+      if (existsSync(target)) {
+        const held = readFileSync(target);
+        if (
+          held.length === file.size &&
+          createHash('sha256').update(held).digest('hex') === file.sha256
+        )
+          continue;
+        await rm(target, { force: true });
+      }
+      this.preparing = { version: manifest.version, received: 0, size: file.size };
+      await this.download(manifest, file.name, target, (received) => {
+        this.preparing = { version: manifest.version, received, size: file.size };
+      });
+    }
+    const versions = [
+      ...new Set(
+        names(this.options.clientDir)
+          .map((name) => clientAsset(name)?.version)
+          .filter((value): value is string => !!value),
+      ),
+    ]
+      .sort((a, b) => (isNewer(a, b) ? -1 : 1))
+      .slice(0, 3);
+    for (const name of names(this.options.clientDir)) {
+      const asset = clientAsset(name);
+      if (asset && !versions.includes(asset.version))
+        await rm(join(this.options.clientDir, name), { force: true });
+    }
   }
   private runtimeLevel() {
     try {

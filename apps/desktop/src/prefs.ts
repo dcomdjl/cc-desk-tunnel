@@ -60,9 +60,9 @@ function read(): Prefs {
       shortcuts: {
         enabled: saved.shortcuts?.enabled !== false,
         keys: Object.fromEntries(
-          Object.entries(saved.shortcuts?.keys ?? {}).filter(
-            (entry): entry is [string, string] => typeof entry[1] === 'string',
-          ),
+          Object.entries(saved.shortcuts?.keys ?? {})
+            .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+            .map(([action, combo]) => [action, combo.replace(/(^|\+)Win(?=\+|$)/g, '$1Meta')]),
         ),
       },
       connection: Object.fromEntries(

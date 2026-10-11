@@ -1,3 +1,4 @@
+import type { DeviceInfo } from './platform.ts';
 import { PROTOCOL_VERSION, serverMessageSchema } from '@cc-desk-tunnel/protocol';
 import type {
   AccountState,
@@ -95,7 +96,12 @@ export class ProxyClient {
   listeners = new Set<() => void>();
   terminalListeners = new Set<(message: TerminalMessage) => void>();
   socket: WebSocket | null = null;
-  credentials: { url: string; token: string; device: Device; reconnect: boolean } | null = null;
+  credentials: {
+    url: string;
+    token: string;
+    device: Device & Partial<Pick<DeviceInfo, 'platform' | 'arch'>>;
+    reconnect: boolean;
+  } | null = null;
   retryTimer: ReturnType<typeof setTimeout> | undefined;
   retryAttempt = 0;
   // Streamed events are merged in batches so a fast reply does not re-render per fragment.
@@ -122,7 +128,12 @@ export class ProxyClient {
     this.state = { ...this.state, ...values };
     for (const listener of this.listeners) listener();
   }
-  connect(url: string, token: string, device: Device, reconnect = true) {
+  connect(
+    url: string,
+    token: string,
+    device: Device & Partial<Pick<DeviceInfo, 'platform' | 'arch'>>,
+    reconnect = true,
+  ) {
     const address = new URL(url);
     if (
       !['ws:', 'wss:'].includes(address.protocol) ||
@@ -175,7 +186,14 @@ export class ProxyClient {
           deviceName: credentials.device.name,
         }),
       );
-      socket.send(JSON.stringify({ type: 'device', id: credentials.device.id }));
+      socket.send(
+        JSON.stringify({
+          type: 'device',
+          id: credentials.device.id,
+          platform: credentials.device.platform,
+          arch: credentials.device.arch,
+        }),
+      );
     };
     socket.onmessage = ({ data }) => {
       if (this.socket !== socket) return;
@@ -186,6 +204,10 @@ export class ProxyClient {
         this.update({ error: '服务消息格式不兼容，已断开连接。' });
         this.credentials = null;
         socket.close();
+        return;
+      }
+      if (message.type === 'client.release') {
+        this.update({ release: message.client?.version ?? null });
         return;
       }
       if (message.type === 'ready') {
