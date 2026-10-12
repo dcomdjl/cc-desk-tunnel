@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProcessSupervisor } from '../electron/process-supervisor.mjs';
@@ -85,3 +85,48 @@ test('shell selection rejects relative paths and unsupported shell kinds', posix
   await assert.rejects(resolvePosixShell({ shellPath: '/bin/sh' }), /zsh 或 bash/);
   await assert.rejects(resolvePosixShell({ shellPath: '/bin/zsh\n' }), /绝对路径/);
 });
+
+test(
+  'shell selection preserves a bash alias pointing to a versioned executable',
+  posix,
+  async (t) => {
+    const f = await fixture(t);
+    const executable = join(f.directory, 'bash-versioned');
+    const alias = join(f.directory, 'bash');
+    await writeFile(executable, '#!/bin/bash\nexec /bin/bash "$@"\n', { mode: 0o700 });
+    await symlink('bash-versioned', alias);
+    assert.equal(await realpath(alias), await realpath(executable));
+    assert.equal(await resolvePosixShell({ shellPath: alias }), alias);
+  },
+);
+
+test('shell selection rejects dangling and non-executable aliases', posix, async (t) => {
+  const f = await fixture(t);
+  const alias = join(f.directory, 'bash');
+  await symlink('missing-version', alias);
+  await assert.rejects(resolvePosixShell({ shellPath: alias }), /找不到本机登录 shell/);
+  await rm(alias);
+  await writeFile(join(f.directory, 'bash-versioned'), '#!/bin/bash\n', { mode: 0o600 });
+  await symlink('bash-versioned', alias);
+  await assert.rejects(resolvePosixShell({ shellPath: alias }), /无法执行本机登录 shell/);
+});
+
+test(
+  'shell initialization preserves spawn errors, exit codes and termination signals',
+  posix,
+  async (t) => {
+    const f = await fixture(t);
+    const shell = join(f.directory, 'broken-shell');
+    await assert.rejects(
+      captureShellEnvironment(shell, f.supervisor, { env: f.env }),
+      /无法启动本机登录 shell（ENOENT）/,
+    );
+    await writeFile(shell, '#!/bin/sh\nexit 7\n', { mode: 0o700 });
+    await assert.rejects(captureShellEnvironment(shell, f.supervisor, { env: f.env }), /退出码 7/);
+    await writeFile(shell, '#!/bin/sh\nkill -TERM $$\n');
+    await assert.rejects(
+      captureShellEnvironment(shell, f.supervisor, { env: f.env }),
+      /信号 SIGTERM/,
+    );
+  },
+);

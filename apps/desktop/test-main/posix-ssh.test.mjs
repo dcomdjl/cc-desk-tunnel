@@ -6,7 +6,6 @@ import { once } from 'node:events';
 import {
   access,
   chmod,
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -260,19 +259,40 @@ test(
 test('a bash symlink retains bash command semantics and glob expansion', mac, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'cc-desk-bash-link-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const executable = join(directory, 'bash-versioned');
-  const alias = join(directory, 'bash');
-  await copyFile('/bin/bash', executable);
-  await chmod(executable, 0o700);
-  // Copied Apple platform binaries need a local signature outside /bin.
-  await execute('/usr/bin/codesign', ['--force', '--sign', '-', executable]);
-  await symlink(executable, alias);
+  const shells = join(directory, "shell's 中文目录");
+  await mkdir(shells);
+  const executable = join(shells, 'bash-versioned');
+  const alias = join(shells, 'bash');
+  // A versioned proxy preserves the original regression: resolving the alias
+  // before selecting flags would pass zsh's -f to bash and disable glob expansion.
+  // Execute the installed shell in place; copying/re-signing /bin/bash also tests
+  // platform binary relocation, which is unrelated to shell invocation semantics.
+  await writeFile(executable, '#!/bin/bash\nexec /bin/bash "$@"\n', { mode: 0o700 });
+  await symlink('bash-versioned', alias);
   const f = await fixture(t, {
     shellPath: alias,
-    setup: (project) => writeFile(join(project, 'matched.txt'), 'file'),
+    setup: (project) =>
+      Promise.all([
+        writeFile(join(project, 'matched.txt'), 'file'),
+        writeFile(
+          join(project, '.bash_profile'),
+          'export CC_DESK_BASH_ALIAS="captured"; echo login >> "$HOME/login-count"\n',
+        ),
+      ]),
   });
-  const { stdout } = await f.ssh("printf '%s' *.txt");
-  assert.equal(stdout.toString(), 'matched.txt');
+  for (let index = 0; index < 2; index++) {
+    const { stdout } = await f.ssh(
+      'printf \'%s\\n\' "$CC_DESK_BASH_ALIAS" "$BASH_VERSION" *.txt; printf \'%s\\n\' {left,right}',
+    );
+    const [environment, version, ...expanded] = stdout.toString().trim().split('\n');
+    assert.equal(environment, 'captured');
+    assert.match(version, /^\d+\.\d+/);
+    assert.deepEqual(expanded, ['matched.txt', 'left', 'right']);
+  }
+  const input = Buffer.from('标准输入经过 bash 别名\n');
+  assert.deepEqual((await f.ssh('cat', input)).stdout, input);
+  await assert.rejects(f.ssh('exit 23'), (error) => error.code === 23);
+  assert.equal((await readFile(join(f.directory, 'login-count'), 'utf8')).trim(), 'login');
 });
 
 test(

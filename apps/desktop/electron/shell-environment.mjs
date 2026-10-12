@@ -112,11 +112,21 @@ export async function captureShellEnvironment(
           noise += chunk.length;
           if (noise > maxBytes) finish(new Error('登录 shell 启动脚本的输出超过大小限制。'));
         });
-      child.once('error', () => finish(new Error('无法启动本机登录 shell。')));
-      child.once('close', (code) => {
+      child.once('error', (error) =>
+        finish(
+          new Error(
+            `无法启动本机登录 shell（${error.code ?? '未知错误'}），请检查路径和执行权限。`,
+          ),
+        ),
+      );
+      child.once('close', (code, signal) => {
         childClosed = true;
         if (code !== 0)
-          return finish(new Error('登录 shell 没有返回有效环境，请检查 zsh 或 bash 启动脚本。'));
+          return finish(
+            new Error(
+              `登录 shell 异常结束（${signal ? `信号 ${signal}` : `退出码 ${code}`}），没有返回有效环境，请检查 shell 文件和启动脚本。`,
+            ),
+          );
         complete();
       });
       function complete() {
